@@ -1,26 +1,26 @@
 import os
 import json
 from typing import Dict, Any, Optional
-from google.adk.agents.llm_agent import LlmAgent
+from google.adk.agents.llm_agent import LlmAgent 
 from dotenv import load_dotenv
+import traceback
 
 
 import sys
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
+project_root_rc = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if project_root_rc not in sys.path:
+    sys.path.insert(0, project_root_rc)
+
 
 from database_manager import get_invoice_by_number, get_po_by_number
-
 from difflib import SequenceMatcher 
 import re 
 
-load_dotenv()
+load_dotenv() 
 if not os.getenv("GOOGLE_API_KEY"):
-    print("CRITICAL WARNING (ReconciliationProcessingAgent): GOOGLE_API_KEY not found. Agent will fail.")
+    print("CRITICAL WARNING (ReconciliationProcessingAgent): GOOGLE_API_KEY not set. LLM will fail.")
 
-
-
+# --- Helper Comparison Functions (Copied here for encapsulation, could be in shared_services) ---
 def _compare_strings_fuzzy_local(s1: Optional[str], s2: Optional[str], threshold=0.8) -> bool:
     if s1 is None and s2 is None: return True
     if s1 is None or s2 is None: return False
@@ -37,17 +37,27 @@ def _compare_amounts_local(amount1: Any, amount2: Any, tolerance=0.01) -> bool:
         return abs(amt1 - amt2) <= tolerance
     except (ValueError, TypeError): return False
 
-def _perform_reconciliation_logic(invoice_data_full: Dict[str, Any], po_data_full: Dict[str, Any]) -> Dict[str, Any]:
+def _get_action_required_local(status: str) -> str: # Renamed to avoid conflict if imported elsewhere
+    actions = { "APPROVED": "Proceed with payment processing or mark as reconciled.",
+                "NEEDS_REVIEW": "Manual review required before approval/reconciliation.",
+                "REJECTED": "Investigate discrepancies and resolve issues." }
+    return actions.get(status, "Unknown status")
+
+def _perform_reconciliation_logic_tool(invoice_data_json_str: str, po_data_json_str: str) -> dict:
     """
-    Core reconciliation logic. Expects full extraction objects.
-    (This is the same logic as _perform_reconciliation from previous agent.py)
+    TOOL for ReconciliationProcessingAgent: Performs reconciliation given JSON strings 
+    of pre-extracted invoice and PO data.
+    The JSON strings are expected to be the full output structure from an extraction step.
     """
-    print("RECON_AGENT_LOGIC: Performing comparison.")
+    print(f"RECON_AGENT_TOOL: _perform_reconciliation_logic_tool called.")
     try:
+        invoice_data_full = json.loads(invoice_data_json_str)
+        po_data_full = json.loads(po_data_json_str)
+
         if invoice_data_full.get("status") != "success":
-            return {"status": "error", "error_message": "Invoice data for reconciliation is not valid."}
+            return {"status": "error", "error_message": f"Invoice data for reconciliation is not valid (status: {invoice_data_full.get('status')})."}
         if po_data_full.get("status") != "success":
-            return {"status": "error", "error_message": "PO data for reconciliation is not valid."}
+            return {"status": "error", "error_message": f"PO data for reconciliation is not valid (status: {po_data_full.get('status')})."}
 
         invoice_data = invoice_data_full.get("data", {})
         po_data = po_data_full.get("data", {})
@@ -71,7 +81,7 @@ def _perform_reconciliation_logic(invoice_data_full: Dict[str, Any], po_data_ful
 
         inv_vendor = invoice_data.get("vendor_name") 
         po_vendor = po_data.get("vendor_name")
-        if _compare_strings_fuzzy_local(inv_vendor, po_vendor): 
+        if _compare_strings_fuzzy_local(inv_vendor, po_vendor):
             matched_fields.append("vendor_name")
         else:
             discrepancies.append(f"Vendor Mismatch: Invoice='{inv_vendor or 'N/A'}' vs PO='{po_vendor or 'N/A'}'")
@@ -94,7 +104,7 @@ def _perform_reconciliation_logic(invoice_data_full: Dict[str, Any], po_data_ful
         if not inv_items and not po_items: total_key_fields = 3 
         match_percentage = (len(matched_fields) / total_key_fields * 100) if total_key_fields > 0 else 0
 
-        status_reco = "REJECTED" # Default
+        status_reco = "REJECTED" 
         if not discrepancies: status_reco = "APPROVED"
         elif "po_number_reference_match" not in matched_fields and inv_ref_po_num and actual_po_num and inv_ref_po_num != actual_po_num: status_reco = "REJECTED"
         elif not actual_po_num: status_reco = "REJECTED"
@@ -119,63 +129,26 @@ def _perform_reconciliation_logic(invoice_data_full: Dict[str, Any], po_data_ful
                              "invoice_total": inv_amount, "po_total": po_amount }
             }
         }
+    except json.JSONDecodeError as e:
+        return {"status": "error", "error_message": f"Invalid JSON input for reconciliation: {str(e)}"}
     except Exception as e:
-        import traceback
-        print(f"ERROR in _perform_reconciliation_logic: {e}\n{traceback.format_exc()}")
+        print(f"ERROR in _perform_reconciliation_logic_tool: {e}\n{traceback.format_exc()}")
         return {"status": "error", "error_message": f"Reconciliation logic error: {str(e)}"}
 
 
-def _reconcile_from_db_by_numbers_tool(invoice_number: str, po_number: str) -> dict:
-    """
-    TOOL: Fetches an invoice and a PO from the database by their numbers,
-    then performs reconciliation between them.
-    """
-    print(f"RECON_AGENT_TOOL: _reconcile_from_db_by_numbers_tool called for Invoice: '{invoice_number}', PO: '{po_number}'")
-    
-    invoice_data_full = get_invoice_by_number(invoice_number)
-    if not invoice_data_full:
-        return {"status": "error", "error_message": f"Invoice '{invoice_number}' not found in database."}
-    if invoice_data_full.get("status") != "success": # Check if the stored data itself indicates prior error
-        return {"status": "error", "error_message": f"Stored invoice '{invoice_number}' has an error status: {invoice_data_full.get('error_message', 'Unknown stored error')}"}
-
-
-    po_data_full = get_po_by_number(po_number)
-    if not po_data_full:
-        return {"status": "error", "error_message": f"Purchase Order '{po_number}' not found in database."}
-    if po_data_full.get("status") != "success":
-        return {"status": "error", "error_message": f"Stored PO '{po_number}' has an error status: {po_data_full.get('error_message', 'Unknown stored error')}"}
-
-    return _perform_reconciliation_logic(invoice_data_full, po_data_full)
-
-def _reconcile_with_provided_data_tool(invoice_data_json_str: str, po_data_json_str: str) -> dict:
-    """
-    TOOL: Performs reconciliation given JSON strings of pre-extracted invoice and PO data.
-    The JSON strings are expected to be the full output structure from an extraction step.
-    """
-    print(f"RECON_AGENT_TOOL: _reconcile_with_provided_data_tool called.")
-    try:
-        invoice_data_full = json.loads(invoice_data_json_str)
-        po_data_full = json.loads(po_data_json_str)
-    except json.JSONDecodeError as e:
-        return {"status": "error", "error_message": f"Invalid JSON input for reconciliation: {str(e)}"}
-
-    return _perform_reconciliation_logic(invoice_data_full, po_data_full)
-
-
-root_agent = LlmAgent(
-    name="reconciliation_specialist_agent",
-    model=os.getenv("MODEL_NAME", "gemini-1.5-flash-latest"),
-    description="Specialized agent for comparing invoice and purchase order data, either fetched from a database or provided directly, to identify discrepancies and determine a reconciliation status.",
+root_agent = LlmAgent( 
+    name="reconciliation_specialist_agent", 
+    model=os.getenv("ADK_MODEL", "gemini-1.5-flash-latest"),
+    description="Specialized agent for comparing pre-extracted invoice and purchase order data to identify discrepancies and determine a reconciliation status.",
     instruction=(
-        "You are a Reconciliation Specialist. Your task is to compare an invoice with a purchase order.\n"
-        "1. If you are given an `invoice_number` and a `po_number`, use the `_reconcile_from_db_by_numbers_tool` to fetch them from the database and reconcile.\n"
-        "2. If you are given `invoice_data_json_str` and `po_data_json_str` (which are JSON strings of already extracted data), use the `_reconcile_with_provided_data_tool`.\n"
-        "3. Report the full reconciliation result (status, approval_status, discrepancies, etc.) back.\n"
-        "Do NOT ask for file paths. Assume data is either in the DB or provided as JSON strings."
+        "You are a Reconciliation Specialist. The Orchestrator will provide you with JSON data for an invoice and a purchase order.\n"
+        "1. You will receive `invoice_data_json_str` and `po_data_json_str`.\n"
+        "2. Use your `_perform_reconciliation_logic_tool` with these JSON strings.\n"
+        "3. Return the complete JSON result from the tool directly back to the Orchestrator.\n"
+        "Do NOT attempt to fetch data from the database or ask for file paths. Assume the data is correctly provided."
     ),
     tools=[
-        _reconcile_from_db_by_numbers_tool,
-        _reconcile_with_provided_data_tool
+        _perform_reconciliation_logic_tool
     ]
 )
 
