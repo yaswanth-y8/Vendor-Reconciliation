@@ -14,7 +14,7 @@ from .agent import root_agent
 __all__ = ["root_agent"]
 
 
-SUPPORTED_DOCUMENT_TYPES = ["invoice", "receipt"]
+SUPPORTED_DOCUMENT_TYPES = ["invoice", "purchase_order"]
 
 SUPPORTED_FILE_FORMATS = [
     "application/pdf",
@@ -26,5 +26,5 @@ SUPPORTED_FILE_FORMATS = [
 RECONCILIATION_STATUSES = ["APPROVED", "NEEDS_REVIEW", "REJECTED"]
 
 
-DEFAULT_AMOUNT_TOLERANCE = 0.01
-DEFAULT_VENDOR_SIMILARITY_THRESHOLD = 0.8
+
+
