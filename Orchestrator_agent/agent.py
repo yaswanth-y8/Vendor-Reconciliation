@@ -1,229 +1,254 @@
-# orchestrator_agent/agent.py
 import os
 import json
-from typing import Dict, Any, Optional
-from google.adk.agents.llm_agent import LlmAgent 
+from typing import Dict, Any, Optional,List
+from google.adk.agents.llm_agent import LlmAgent
 from dotenv import load_dotenv
 import traceback
+import asyncio 
 
-
+# Path setup
 import sys
 project_root_orch = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root_orch not in sys.path: sys.path.insert(0, project_root_orch)
 
-from Data_ingestion_agent.agent import _ingest_and_store_document_tool as ingest_tool_function
-from Reconciliation_agent.agent import _perform_reconciliation_logic_tool as reconcile_tool_function
+# Import the A2A client and hypothetical types
+from client import a2a_client, SendMessageRequest, MessageSendParams, Part # Use your actual client
+
+# Import DB functions for direct checks by Orchestrator if needed
 from database_manager import get_invoice_by_number, get_po_by_number, get_invoice_by_related_po
+import google.generativeai as genai
+
+# --- AgentCard Definition for Orchestrator (optional, but good practice) ---
+ORCH_AGENT_HOST = os.getenv("ORCH_AGENT_HOST", "localhost")
+ORCH_AGENT_PORT = int(os.getenv("ORCH_AGENT_PORT", 8000)) # Main agent port
+
+
+
+
+
+class AgentCapability: # Mock
+    def __init__(self, name: str, description: str, input_schema=None, output_schema=None):
+        self.name = name
+        self.description = description
+        # self.input_schema = input_schema # Store if needed for to_dict
+        # self.output_schema = output_schema # Store if needed for to_dict
+    def to_dict(self) -> Dict[str, Any]: # ADDED
+        return {"name": self.name, "description": self.description}
+
+class AgentSkill: # Mock
+    def __init__(self, name: str, description: str, capabilities: List[AgentCapability]):
+        self.name = name
+        self.description = description
+        self.capabilities = capabilities
+    def to_dict(self) -> Dict[str, Any]: # ADDED
+        return {
+            "name": self.name, 
+            "description": self.description, 
+            "capabilities": [cap.to_dict() for cap in self.capabilities]
+        }
+
+class AgentCard: # Mock
+    def __init__(self, name: str, description: str, url: str, version: str, 
+                 defaultInputModes: List[str], defaultOutputModes: List[str], 
+                 capabilities: List[AgentCapability], # Assuming top-level capabilities
+                 skills: List[AgentSkill]):
+        self.name = name
+        self.description = description
+        self.url = url
+        self.version = version
+        self.defaultInputModes = defaultInputModes
+        self.defaultOutputModes = defaultOutputModes
+        self.capabilities = capabilities # List of AgentCapability objects
+        self.skills = skills # List of AgentSkill objects
+
+    def to_dict(self) -> Dict[str, Any]: # ADDED
+        return {
+            "name": self.name,
+            "description": self.description,
+            "url": self.url,
+            "version": self.version,
+            "defaultInputModes": self.defaultInputModes,
+            "defaultOutputModes": self.defaultOutputModes,
+            "capabilities": [cap.to_dict() for cap in self.capabilities],
+            "skills": [skill.to_dict() for skill in self.skills]
+        }
+
+
+
+orchestrator_capability = AgentCapability(name="_orchestrate_po_reconciliation_tool", description="Manages the PO-centric reconciliation workflow.")
+orchestrator_skill = AgentSkill(name="Reconciliation Orchestration", description="Coordinates data ingestion and reconciliation sub-tasks.", capabilities=[orchestrator_capability])
+
+orchestrator_agent_card = AgentCard(
+    name="vendor_reconciliation_orchestrator_a2a",
+    description="Main orchestrator AI agent for vendor reconciliation via A2A.",
+    url=f"http://{ORCH_AGENT_HOST}:{ORCH_AGENT_PORT}/invoke",
+    version="1.0.0",
+    defaultInputModes=["text/plain"], defaultOutputModes=["application/json"],
+    capabilities=[], skills=[orchestrator_skill]
+)
+print(f"ORCHESTRATOR_AGENT: Defined AgentCard: {json.dumps(orchestrator_agent_card.to_dict(), indent=2)}")
+print("ORCHESTRATOR_AGENT: Registering sub-agent URLs/names with A2AClient (mock)...")
+a2a_client.register_agent_url(
+    "data_ingestion_specialist_agent", 
+    # For the mock, the URL isn't strictly used for HTTP, but good to have.
+    # It's the NAME that the mock A2AClient uses to find the right Python function.
+    f"http://{os.getenv('DATA_INGESTION_AGENT_HOST', 'localhost')}:{int(os.getenv('DATA_INGESTION_AGENT_PORT', 8001))}/mock_invoke" 
+)
+a2a_client.register_agent_url(
+    "reconciliation_specialist_agent", 
+    f"http://{os.getenv('RECON_AGENT_HOST', 'localhost')}:{int(os.getenv('RECON_AGENT_PORT', 8002))}/mock_invoke"\
+)
+
+
 
 if not os.getenv("GOOGLE_API_KEY"):
-    print("CRITICAL WARNING (OrchestratorAgent): GOOGLE_API_KEY not set. LLM will fail.")
+    print("CRITICAL WARNING (OrchestratorAgent): GOOGLE_API_KEY not set.")
+elif not getattr(genai, 'API_KEY', None) and os.getenv("GOOGLE_API_KEY"):
+    try: genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+    except Exception as e: print(f"Error configuring GenAI in OrchestratorAgent: {e}")
 
 
-
-def _process_reconciliation_starting_with_po(
-    
-    po_number_input: Optional[str] = None, 
+async def _orchestrate_po_reconciliation_tool( 
+    po_number_input: str,
     new_po_file_path: Optional[str] = None,
-    new_invoice_file_path: Optional[str] = None,
-    specific_invoice_number_to_find_in_db: Optional[str] = None 
+    new_invoice_file_path: Optional[str] = None
     ) -> dict:
     """
-    TOOL (Orchestrator): Drives reconciliation.
-    - If new_po_file_path is given, it's prioritized for PO data. po_number_input can be used as a reference/target.
-    - If only po_number_input is given, it's fetched from DB.
-    - Then, it attempts to get invoice data (specific_invoice_number_to_find_in_db, then related from PO, then new_invoice_file_path).
+    TOOL (Orchestrator): Drives reconciliation starting with a PO number.
+    Delegates to sub-agents via A2A calls.
     """
-    print(f"ORCHESTRATOR_TOOL_V3: Called with: "
-          f"po_num_in='{po_number_input}', new_po_file='{new_po_file_path}', "
-          f"new_inv_file='{new_invoice_file_path}', spec_inv_num='{specific_invoice_number_to_find_in_db}'")
+    print(f"ORCHESTRATOR_A2A_TOOL: po_number='{po_number_input}', "
+          f"new_po_file='{new_po_file_path}', new_inv_file='{new_invoice_file_path}'")
 
     final_report: Dict[str, Any] = {"steps_taken": [], "overall_status": "pending"}
-    po_extraction_obj: Optional[Dict[str, Any]] = None
-    invoice_extraction_obj: Optional[Dict[str, Any]] = None
+    po_extraction_full_obj: Optional[Dict[str, Any]] = None
+    invoice_extraction_full_obj: Optional[Dict[str, Any]] = None
     
+    po_number_to_process = po_number_input.strip().upper() if po_number_input else None
+    if not po_number_to_process:
+        return {"status": "error", "error_message": "PO number input is required."}
+
     
-    effective_po_number_for_processing = po_number_input.strip().upper() if po_number_input else None
+    step_msg_po = f"Step 1: Acquiring PO '{po_number_to_process}'."
+    final_report["steps_taken"].append(step_msg_po); print(f"ORCHESTRATOR: {step_msg_po}")
+    po_from_db = get_po_by_number(po_number_to_process)
 
-
-    step_msg_po = ""
-    if new_po_file_path:
-        step_msg_po = f"Step 1: Processing new PO file: '{new_po_file_path}'."
-        ingestion_result = ingest_tool_function(raw_document_file_path=new_po_file_path, document_type="purchase_order")
-        final_report["po_acquisition"] = ingestion_result
-        if ingestion_result.get("status") == "success":
-            po_extraction_obj = ingestion_result.get("full_extraction_result")
-            extracted_po_num = po_extraction_obj.get("data",{}).get("document_number","").strip().upper()
-            if not extracted_po_num: 
-                 final_report["overall_status"] = "error"
-                 final_report["error_message"] = "Failed to extract document number from the provided new PO file."
-                 print(f"ORCHESTRATOR_TOOL_V3: {step_msg_po}\n  {final_report['error_message']}")
-                 final_report["steps_taken"].append(step_msg_po)
-                 return final_report
-            
-            if effective_po_number_for_processing and extracted_po_num != effective_po_number_for_processing:
-                step_msg_po += f" Note: User might have mentioned PO '{effective_po_number_for_processing}', but file extracted as '{extracted_po_num}'. Using extracted number '{extracted_po_num}'."
-            effective_po_number_for_processing = extracted_po_num # Prioritize number from actual document
-            step_msg_po += f" Successfully ingested new PO as '{effective_po_number_for_processing}'."
-        else: # Ingestion of new PO file failed
-            final_report["overall_status"] = "error"
-            final_report["error_message"] = f"Failed to ingest new PO file '{new_po_file_path}': {ingestion_result.get('error_message')}"
-            print(f"ORCHESTRATOR_TOOL_V3: {step_msg_po}\n  {final_report['error_message']}")
-            final_report["steps_taken"].append(step_msg_po)
-            return final_report
-    elif effective_po_number_for_processing: 
-        step_msg_po = f"Step 1: Attempting to retrieve existing PO '{effective_po_number_for_processing}' from database."
-        po_extraction_obj = get_po_by_number(effective_po_number_for_processing)
-        if po_extraction_obj:
-            step_msg_po += f" Found existing PO '{effective_po_number_for_processing}' in database."
-            final_report["po_acquisition"] = {"status": "success_from_db", "source": "database", 
-                                              "document_number": po_extraction_obj.get("data",{}).get("document_number")}
-        else: # PO not found in DB, and no new file path was given in this call
-            step_msg_po += f" PO '{effective_po_number_for_processing}' not found in database. A new PO file for this number is needed."
-            final_report["overall_status"] = "po_not_found_needs_file"
-            final_report["message_to_user"] = step_msg_po
-            final_report["required_next_input"] = "new_po_file_path" # LLM should ask for this
-            final_report["context_po_number"] = effective_po_number_for_processing # For LLM to use in follow-up
-            print(f"ORCHESTRATOR_TOOL_V3: {step_msg_po}")
-            final_report["steps_taken"].append(step_msg_po)
-            return final_report
-    else: # No po_number_input and no new_po_file_path
-        final_report["overall_status"] = "error"
-        final_report["error_message"] = "No PO information (neither number for DB lookup nor new file path) was provided."
-        final_report["steps_taken"].append("Step 1: PO acquisition failed due to missing input.")
-        return final_report
+    if po_from_db:
+        po_extraction_full_obj = po_from_db
+        final_report["po_acquisition"] = {"status": "success_from_db", "source": "database", "doc_number": po_extraction_full_obj.get("data",{}).get("document_number")}
+        step_msg_po += " Found in database."
+    elif new_po_file_path:
+        step_msg_po += f" Not in DB. Delegating ingestion of new file '{new_po_file_path}'."
         
-    final_report["steps_taken"].append(step_msg_po)
-    print(f"ORCHESTRATOR_TOOL_V3: {step_msg_po}")
+        ingestion_query = (f"Use your `_ingest_and_store_document_tool` to process this document: "
+                           f"File path is '{new_po_file_path}', document type is 'purchase_order'. "
+                           f"Return the full JSON result from your tool.") 
+        
+        
+        ingestion_query_for_mock_a2a = (
+            f"_ingest_and_store_document_tool: {json.dumps({'raw_document_file_path': new_po_file_path, 'document_type': 'purchase_order'})}"
+        )
+        a2a_request = SendMessageRequest(
+            agent_id_or_url="data_ingestion_specialist_agent", 
+            message=MessageSendParams(parts=[Part(text=ingestion_query_for_mock_a2a)])
+        )
+        ingestion_response_dict = await a2a_client.send_message(a2a_request) # Use the A2A client
 
-    # Safeguard: PO data must be valid to proceed
-    if not po_extraction_obj or po_extraction_obj.get("status") != "success":
-        final_report["overall_status"] = "error"
-        final_report["error_message"] = final_report.get("po_acquisition",{}).get("error_message", "Valid PO data could not be obtained.")
-        return final_report
-    if not effective_po_number_for_processing: # Should be set if po_extraction_obj is valid
-        effective_po_number_for_processing = po_extraction_obj.get("data",{}).get("document_number","").strip().upper()
-        if not effective_po_number_for_processing:
-            final_report["overall_status"] = "error"; final_report["error_message"] = "Critical: PO number missing after PO processing."
-            return final_report
-
-
-    # --- Step 2: Secure the Invoice data ---
-    step_msg_inv = ""
-    if new_invoice_file_path:
-        step_msg_inv = f"Step 2: Processing provided new invoice file: '{new_invoice_file_path}' (intended for PO '{effective_po_number_for_processing}')."
-        ingestion_result = ingest_tool_function(raw_document_file_path=new_invoice_file_path, document_type="invoice")
-        final_report["invoice_acquisition"] = ingestion_result
-        if ingestion_result.get("status") == "success":
-            invoice_extraction_obj = ingestion_result.get("full_extraction_result")
-            # Optional: Cross-check if new invoice actually relates to the effective_po_number_for_processing
-            extracted_related_po = invoice_extraction_obj.get("data",{}).get("related_po_number","").strip().upper()
-            if extracted_related_po and extracted_related_po != effective_po_number_for_processing:
-                step_msg_inv += (f" Warning: New invoice processed. It references PO '{extracted_related_po}', "
-                                 f"but reconciliation is against PO '{effective_po_number_for_processing}'.")
-            elif not extracted_related_po:
-                 step_msg_inv += (f" Note: New invoice processed. It does not explicitly reference PO '{effective_po_number_for_processing}'. "
-                                  "Reconciliation will proceed based on user intent.")
-            step_msg_inv += " Successfully ingested new invoice."
-        else: # Failed to ingest the provided new invoice file
-            final_report["overall_status"] = "error"
-            final_report["error_message"] = f"Failed to ingest new invoice file '{new_invoice_file_path}': {ingestion_result.get('error_message')}"
-            print(f"ORCHESTRATOR_TOOL_V3: {step_msg_inv}\n  {final_report['error_message']}")
-            final_report["steps_taken"].append(step_msg_inv)
-            return final_report
-            
-    elif specific_invoice_number_to_find_in_db: # User specified an existing invoice number
-        inv_to_find = specific_invoice_number_to_find_in_db.strip().upper()
-        step_msg_inv = f"Step 2: Attempting to retrieve specific existing Invoice '{inv_to_find}' from database (for PO '{effective_po_number_for_processing}')."
-        invoice_extraction_obj = get_invoice_by_number(inv_to_find)
-        if invoice_extraction_obj:
-            related_po_on_found_inv = invoice_extraction_obj.get("data",{}).get("related_po_number","").strip().upper()
-            if related_po_on_found_inv and related_po_on_found_inv != effective_po_number_for_processing:
-                step_msg_inv += (f" Warning: Found specified Invoice '{inv_to_find}', but it references PO '{related_po_on_found_inv}' "
-                                 f"instead of target PO '{effective_po_number_for_processing}'. Reconciliation might highlight this.")
-            final_report["invoice_acquisition"] = {"status": "success_from_db_specific", "source": "database", "document_number": inv_to_find}
-        else: 
-             step_msg_inv += f" Specified Invoice '{inv_to_find}' not found in database."
-             final_report["overall_status"] = "invoice_not_found_needs_file" # Specific status
-             final_report["message_to_user"] = step_msg_inv
-             final_report["required_next_input"] = "new_invoice_file_path"
-             final_report["context_po_number"] = effective_po_number_for_processing # For LLM to use
-             print(f"ORCHESTRATOR_TOOL_V3: {step_msg_inv}")
-             final_report["steps_taken"].append(step_msg_inv)
-             return final_report
-    
-    else: # No new_invoice_file_path and no specific_invoice_number_db, so search DB for related invoice
-        step_msg_inv = f"Step 2: Attempting to find an invoice in database related to PO '{effective_po_number_for_processing}'."
-        invoice_extraction_obj = get_invoice_by_related_po(effective_po_number_for_processing)
-        if invoice_extraction_obj:
-            inv_num_found = invoice_extraction_obj.get('data',{}).get('document_number', 'UNKNOWN')
-            step_msg_inv += f" Found invoice '{inv_num_found}' related to PO '{effective_po_number_for_processing}' in database."
-            final_report["invoice_acquisition"] = {"status": "success_from_db_related_to_po", "source": "database", "document_number": inv_num_found}
-        else: # No related invoice found in DB, and no new file path given in *this* call
-            step_msg_inv += (f" No invoice related to PO '{effective_po_number_for_processing}' found in database. "
-                             f"A new invoice file is needed for reconciliation.")
-            final_report["overall_status"] = "po_secured_invoice_needed" # Specific status
-            final_report["message_to_user"] = step_msg_inv
-            final_report["required_next_input"] = "new_invoice_file_path"
-            final_report["context_po_number"] = effective_po_number_for_processing
-            final_report["po_data_processed_summary"] = po_extraction_obj.get("data", {}).get("document_number","N/A") # po_extraction_obj is valid here
-            print(f"ORCHESTRATOR_TOOL_V3: {step_msg_inv}")
-            final_report["steps_taken"].append(step_msg_inv)
-            return final_report
-
-    final_report["steps_taken"].append(step_msg_inv)
-    print(f"ORCHESTRATOR_TOOL_V3: {step_msg_inv}")
-
-    # Safeguards
-    if not invoice_extraction_obj or invoice_extraction_obj.get("status") != "success":
-        final_report["overall_status"] = "error"
-        final_report["error_message"] = final_report.get("invoice_acquisition",{}).get("error_message","Valid Invoice data could not be obtained.")
-        return final_report
-    if not po_extraction_obj or po_extraction_obj.get("status") != "success": # Should be fine by now
-        final_report["overall_status"] = "error"; final_report["error_message"] = "Valid PO data not available for reconciliation."
-        return final_report
-
-    # --- Step 3: Perform Reconciliation ---
-    step_msg_reco = "Step 3: Both PO and Invoice data are available. Performing reconciliation."
-    final_report["steps_taken"].append(step_msg_reco)
-    print(f"ORCHESTRATOR_TOOL_V3: {step_msg_reco}")
-    
-    reconciliation_response_str = _delegate_to_reconciliation_agent_tool_sync_placeholder(
-        invoice_data_json_str=json.dumps(invoice_extraction_obj),
-        po_data_json_str=json.dumps(po_extraction_obj)
-    )
-    reconciliation_call_outcome = json.loads(reconciliation_response_str)
-    final_report["reconciliation_report"] = reconciliation_call_outcome
-
-    if reconciliation_call_outcome.get("status") == "success":
-        final_report["overall_status"] = "success_reconciled"
-        final_report["message"] = "Reconciliation process complete."
+        final_report["po_acquisition"] = ingestion_response_dict
+        if ingestion_response_dict.get("status") == "success":
+            po_extraction_full_obj = ingestion_response_dict.get("full_extraction_result")
+            extracted_po_num = po_extraction_full_obj.get("data",{}).get("document_number","").strip().upper()
+            if extracted_po_num and extracted_po_num != po_number_to_process:
+                step_msg_po += f" File extracted as PO '{extracted_po_num}'. Using this."
+                po_number_to_process = extracted_po_num
+            step_msg_po += f" Successfully ingested new PO as '{po_number_to_process}' via A2A."
+        else:
+            final_report["overall_status"] = "error"; final_report["error_message"] = f"A2A PO ingestion failed: {ingestion_response_dict.get('error_message')}"
+            final_report["steps_taken"].append(step_msg_po); print(f"ORCHESTRATOR: {step_msg_po} - Error"); return final_report
     else:
-        final_report["overall_status"] = "error_in_reconciliation"
-        final_report["error_message"] = f"Reconciliation failed: {reconciliation_call_outcome.get('error_message')}"
+        step_msg_po += f" PO '{po_number_to_process}' not found in DB and no new file provided."
+        final_report["overall_status"] = "po_not_found_needs_file"; final_report["message_to_user"] = step_msg_po
+        final_report["required_next_input"] = "new_po_file_path"; final_report["context_po_number"] = po_number_to_process
+        final_report["steps_taken"].append(step_msg_po); print(f"ORCHESTRATOR: {step_msg_po}"); return final_report
+    
+    final_report["steps_taken"].append(step_msg_po); print(f"ORCHESTRATOR: {step_msg_po}")
+
+    if not po_extraction_full_obj or po_extraction_full_obj.get("status") != "success":
+        final_report["overall_status"] = "error"; final_report["error_message"] = "Valid PO data not obtained."
+        return final_report
+    confirmed_po_number = po_extraction_full_obj.get("data", {}).get("document_number", "").strip().upper()
+    if not confirmed_po_number:
+        final_report["overall_status"] = "error"; final_report["error_message"] = "Critical: PO number missing."
+        return final_report
+
+    
+    step_msg_inv = f"Step 2: Acquiring Invoice related to PO '{confirmed_po_number}'."
+    final_report["steps_taken"].append(step_msg_inv); print(f"ORCHESTRATOR: {step_msg_inv}")
+    if new_invoice_file_path:
+        step_msg_inv += f" Delegating ingestion of new invoice file '{new_invoice_file_path}'."
+        ingestion_query_for_mock_a2a = (
+             f"_ingest_and_store_document_tool: {json.dumps({'raw_document_file_path': new_invoice_file_path, 'document_type': 'invoice'})}"
+        )
+        a2a_request_inv = SendMessageRequest(
+            agent_id_or_url="data_ingestion_specialist_agent",
+            message=MessageSendParams(parts=[Part(text=ingestion_query_for_mock_a2a)])
+        )
+        ingestion_response_dict_inv = await a2a_client.send_message(a2a_request_inv)
+        final_report["invoice_acquisition"] = ingestion_response_dict_inv
+        if ingestion_response_dict_inv.get("status") == "success":
+            invoice_extraction_full_obj = ingestion_response_dict_inv.get("full_extraction_result")
+            step_msg_inv += " Successfully ingested new invoice via A2A."
+        else:
+            final_report["overall_status"] = "error"; final_report["error_message"] = f"A2A Invoice ingestion failed: {ingestion_response_dict_inv.get('error_message')}"
+            final_report["steps_taken"].append(step_msg_inv); print(f"ORCHESTRATOR: {step_msg_inv} - Error"); return final_report
+    else:
+        step_msg_inv += f" Searching DB for invoice related to PO '{confirmed_po_number}'."
+        invoice_extraction_full_obj = get_invoice_by_related_po(confirmed_po_number)
+        if invoice_extraction_full_obj:
+            inv_num_found = invoice_extraction_full_obj.get('data',{}).get('document_number', 'UNKNOWN')
+            step_msg_inv += f" Found related invoice '{inv_num_found}' in DB."
+            final_report["invoice_acquisition"] = {"status": "success_from_db_related_to_po", "source": "database", "document_number": inv_num_found}
+        else:
+            step_msg_inv += f" No related invoice found in DB for PO '{confirmed_po_number}'."
+            final_report["overall_status"] = "po_secured_invoice_needed"; final_report["message_to_user"] = step_msg_inv
+            final_report["required_next_input"] = "new_invoice_file_path"; final_report["context_po_number"] = confirmed_po_number
+            final_report["steps_taken"].append(step_msg_inv); print(f"ORCHESTRATOR: {step_msg_inv}"); return final_report
+            
+    final_report["steps_taken"].append(step_msg_inv); print(f"ORCHESTRATOR: {step_msg_inv}")
+
+    if not invoice_extraction_full_obj or invoice_extraction_full_obj.get("status") != "success":
+        final_report["overall_status"] = "error"; final_report["error_message"] = "Valid Invoice data not obtained."
+        return final_report
+
+    
+    step_msg_reco = f"Step 3: Delegating reconciliation to ReconciliationAgent."
+    final_report["steps_taken"].append(step_msg_reco); print(f"ORCHESTRATOR: {step_msg_reco}")
+    
+    reco_query_for_mock_a2a = (
+        f"_perform_reconciliation_logic_tool: {json.dumps({
+            'invoice_data_json_str': json.dumps(invoice_extraction_full_obj), 
+            'po_data_json_str': json.dumps(po_extraction_full_obj)
+        })}"
+    )
+    a2a_request_reco = SendMessageRequest(
+        agent_id_or_url="reconciliation_specialist_agent",
+        message=MessageSendParams(parts=[Part(text=reco_query_for_mock_a2a)])
+    )
+    reco_response_dict = await a2a_client.send_message(a2a_request_reco)
+    final_report["reconciliation_report"] = reco_response_dict
+
+    if reco_response_dict.get("status") == "success":
+        final_report["overall_status"] = "success_reconciled"; final_report["message"] = "Reconciliation complete."
+    else:
+        final_report["overall_status"] = "error_in_reconciliation"; final_report["error_message"] = f"Reconciliation A2A call failed: {reco_response_dict.get('error_message')}"
             
     return final_report
 
-
-# Placeholder sync versions (same as before)
-def _delegate_to_data_ingestion_agent_tool_sync_placeholder(raw_document_file_path: str, document_type: str) -> str:
-    try: result_dict = ingest_tool_function(raw_document_file_path=raw_document_file_path, document_type=document_type)
-    except Exception as e: result_dict = {"status": "error", "error_message": f"Delegate placeholder (ingestion) exception: {str(e)}"}
-    return json.dumps(result_dict)
-
-def _delegate_to_reconciliation_agent_tool_sync_placeholder(invoice_data_json_str: str, po_data_json_str: str) -> str:
-    try: result_dict = reconcile_tool_function(invoice_data_json_str=invoice_data_json_str, po_data_json_str=po_data_json_str)
-    except Exception as e: result_dict = {"status": "error", "error_message": f"Delegate placeholder (reconciliation) exception: {str(e)}"}
-    return json.dumps(result_dict)
-
-
 # Orchestrator LlmAgent instance
 root_agent = LlmAgent(
-    name="interactive_reconciliation_orchestrator", 
+    name=orchestrator_agent_card.name, # Use name from AgentCard
     model=os.getenv("ADK_MODEL", "gemini-1.5-flash-latest"),
-    description=(
-        "Orchestrator AI agent for vendor reconciliation. Guides user through providing PO information, "
-        "then invoice information if needed, and coordinates document processing and reconciliation."
-    ),
+    description=orchestrator_agent_card.description,
     instruction=(
         "You are the Vendor Reconciliation Orchestrator. Your primary goal is to reconcile an invoice with a Purchase Order (PO).\n\n"
         "**Your Main Tool:** `_process_reconciliation_starting_with_po`.\n\n"
@@ -252,7 +277,7 @@ root_agent = LlmAgent(
         "**Goal:** Guide the user to provide information step-by-step so you can eventually call `_process_reconciliation_starting_with_po` with enough arguments for it to either complete the reconciliation or return a status asking for the next specific piece of missing information (which you then ask the user for)."
     ),
     tools=[
-        _process_reconciliation_starting_with_po
+        _orchestrate_po_reconciliation_tool
     ]
 )
 
