@@ -1,172 +1,427 @@
 import os
 import json
-from typing import Dict, Any, Optional,List
+from typing import Dict, Any, Optional, List
 from google.adk.agents.llm_agent import LlmAgent
+from dotenv import load_dotenv
 import traceback
-
+import asyncio
+import httpx
+import uuid
+import pydantic
 
 import sys
-project_root_rc = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-if project_root_rc not in sys.path: sys.path.insert(0, project_root_rc)
+project_root_orch = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if project_root_orch not in sys.path: sys.path.insert(0, project_root_orch)
 
-from database_manager import get_invoice_by_number, get_po_by_number
-from difflib import SequenceMatcher 
-import re 
+# --- A2A Type Placeholders ---
+DiscoveredA2AClientClass = None
+SendMessageRequest, MessageSendParams, Message, Part, Task, Role = None, None, None, None, None, None
+AgentCapabilities, AgentSkill, AgentCard = None, None, None # Using original names from a2a.types
+SendMessageResponse, SendMessageSuccessResponse = None, None, None
+A2ACardResolverClass = None # For dynamic discovery
+
+shared_httpx_client: Optional[httpx.AsyncClient] = None
+
+try:
+    from a2a.client.client import A2AClient as ActualDiscoveredClient
+    from a2a.client import A2ACardResolver as ResolverClass 
+    from a2a.types import (
+        SendMessageRequest,
+        MessageSendParams,
+        Message,
+        Part,
+        Task,
+        Role,
+        AgentCard,          
+        AgentCapabilities,  
+        AgentSkill,         
+        SendMessageResponse,
+        SendMessageSuccessResponse,
+    )
+
+    DiscoveredA2AClientClass = ActualDiscoveredClient
+    A2ACardResolverClass = ResolverClass # Assign the imported resolver
+    # Other types are directly available by their original names
+    print("SUCCESS: Client, Resolver, and types (AgentCard, AgentCapabilities, AgentSkill, etc.) from 'a2a.types' imported.")
+
+except ImportError as e:
+    print(f"ERROR: Could not import client, resolver, or all necessary types from 'a2a.types': {e}")
+    print("       A2A functionality will be severely impaired or unavailable.")
+   
+
+
+from database_manager import get_invoice_by_number, get_po_by_number, get_invoice_by_related_po
 import google.generativeai as genai
 
-
-RECON_AGENT_HOST = os.getenv("RECON_AGENT_HOST", "localhost")
-RECON_AGENT_PORT = int(os.getenv("RECON_AGENT_PORT", 8002)) 
-
-
-class AgentCapability: 
-    def __init__(self, name: str, description: str, input_schema=None, output_schema=None):
-        self.name = name
-        self.description = description
-        
-    def to_dict(self) -> Dict[str, Any]: 
-        return {"name": self.name, "description": self.description}
-
-class AgentSkill: 
-    def __init__(self, name: str, description: str, capabilities: List[AgentCapability]):
-        self.name = name
-        self.description = description
-        self.capabilities = capabilities
-    def to_dict(self) -> Dict[str, Any]: 
-        return {
-            "name": self.name, 
-            "description": self.description, 
-            "capabilities": [cap.to_dict() for cap in self.capabilities]
-        }
-
-class AgentCard: 
-    def __init__(self, name: str, description: str, url: str, version: str, 
-                 defaultInputModes: List[str], defaultOutputModes: List[str], 
-                 capabilities: List[AgentCapability], 
-                 skills: List[AgentSkill]):
-        self.name = name
-        self.description = description
-        self.url = url
-        self.version = version
-        self.defaultInputModes = defaultInputModes
-        self.defaultOutputModes = defaultOutputModes
-        self.capabilities = capabilities 
-        self.skills = skills 
-
-    def to_dict(self) -> Dict[str, Any]: 
-        return {
-            "name": self.name,
-            "description": self.description,
-            "url": self.url,
-            "version": self.version,
-            "defaultInputModes": self.defaultInputModes,
-            "defaultOutputModes": self.defaultOutputModes,
-            "capabilities": [cap.to_dict() for cap in self.capabilities],
-            "skills": [skill.to_dict() for skill in self.skills]
-        }
+ORCH_AGENT_HOST = os.getenv("ORCH_AGENT_HOST", "127.0.0.1") 
+ORCH_AGENT_PORT = int(os.getenv("ORCH_AGENT_PORT", 8000))
 
 
-reco_capability = AgentCapability(
-    name="_perform_reconciliation_logic_tool",
-    description="Compares extracted invoice and PO data."
-)
-reco_skill = AgentSkill(
-    name="Document Reconciliation Skill",
-    description="Performs detailed comparison of financial documents.",
-    capabilities=[reco_capability]
-)
+orchestrator_agent_card_instance = None
 
-reconciliation_agent_card = AgentCard(
-    name="reconciliation_specialist_agent", 
-    description="Specialized agent for comparing invoice and PO data.",
-    url=f"http://{RECON_AGENT_HOST}:{RECON_AGENT_PORT}/invoke", 
-    version="1.0.0",
-    defaultInputModes=["application/json"], 
-    defaultOutputModes=["application/json"],
-    capabilities=[],
-    skills=[reco_skill]
-)
-print(f"RECONCILIATION_AGENT: Defined AgentCard: {json.dumps(reconciliation_agent_card.to_dict(), indent=2)}")
+if AgentCard and AgentCapabilities and AgentSkill:
+    try:
+        orchestrator_main_skill_obj = AgentSkill(
+            id="reconciliation_orchestration_skill",
+            name="Reconciliation Orchestration",
+            description="Coordinates data ingestion and reconciliation sub-tasks for purchase orders and invoices.",
+            tags=["orchestration", "reconciliation", "finance"]
+        )
+        orchestrator_broad_capabilities_obj = AgentCapabilities(
+            pushNotifications=False,
+            stateTransitionHistory=True,
+            streaming=False
+        )
+        orchestrator_agent_card_instance = AgentCard(
+            name="vendor_reconciliation_orchestrator_a2a",
+            description="Main orchestrator AI agent for vendor reconciliation via A2A.",
+            url=f"http://{ORCH_AGENT_HOST}:{ORCH_AGENT_PORT}/invoke", 
+            version="1.0.0",
+            defaultInputModes=["text/plain"],
+            defaultOutputModes=["application/json"],
+            capabilities=orchestrator_broad_capabilities_obj,
+            skills=[orchestrator_main_skill_obj]
+        )
+        print(f"ORCHESTRATOR_AGENT: Defined AgentCard using a2a.types: {orchestrator_agent_card_instance.model_dump_json(indent=2)}")
+    except pydantic.ValidationError as ve_card:
+        print(f"PYDANTIC VALIDATION ERROR creating orchestrator_agent_card_instance: {ve_card}")
+        orchestrator_agent_card_instance = None
+    except Exception as e_card:
+        print(f"ERROR creating orchestrator_agent_card_instance using a2a.types: {e_card}")
+        orchestrator_agent_card_instance = None
+else:
+    print("WARN: SDK types AgentCard, AgentCapabilities, or AgentSkill not imported. Orchestrator agent card not defined.")
 
+
+DATA_INGESTION_AGENT_BASE_URL = f"http://{os.getenv('DATA_INGESTION_AGENT_HOST', '127.0.0.1')}:{int(os.getenv('DATA_INGESTION_AGENT_PORT', 8001))}"
+RECONCILIATION_AGENT_BASE_URL = f"http://{os.getenv('RECON_AGENT_HOST', '127.0.0.1')}:{int(os.getenv('RECON_AGENT_PORT', 8002))}"
 
 
 if not os.getenv("GOOGLE_API_KEY"):
-    print("CRITICAL WARNING (ReconciliationAgent): GOOGLE_API_KEY not set.")
+    print("CRITICAL WARNING (OrchestratorAgent): GOOGLE_API_KEY not set.")
 elif not getattr(genai, 'API_KEY', None) and os.getenv("GOOGLE_API_KEY"):
     try: genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-    except Exception as e: print(f"Error configuring GenAI in ReconciliationAgent: {e}")
-
-def _compare_strings_fuzzy_local(s1,s2,t=0.8): ... 
-def _compare_amounts_local(a1,a2,t=0.01): ...
-def _get_action_required_local(s): ...
-
-def _compare_strings_fuzzy_local(s1: Optional[str], s2: Optional[str], threshold=0.8) -> bool:
-    if s1 is None and s2 is None: return True; 
-    if s1 is None or s2 is None: return False
-    clean_s1 = re.sub(r'[^\w\s]', '', s1.lower().strip()); clean_s2 = re.sub(r'[^\w\s]', '', s2.lower().strip())
-    if not clean_s1 and not clean_s2: return True
-    if not clean_s1 or not clean_s2: return False
-    return SequenceMatcher(None, clean_s1, clean_s2).ratio() >= threshold
-def _compare_amounts_local(amount1: Any, amount2: Any, tolerance=0.01) -> bool:
-    try: 
-        amt1 = float(str(amount1).replace(',','')) if amount1 is not None else 0.0
-        amt2 = float(str(amount2).replace(',','')) if amount2 is not None else 0.0
-        return abs(amt1 - amt2) <= tolerance
-    except (ValueError, TypeError): return False
-def _get_action_required_local(status: str) -> str: 
-    actions = { "APPROVED": "Proceed.", "NEEDS_REVIEW": "Manual review.", "REJECTED": "Investigate." }
-    return actions.get(status, "Unknown status")
+    except Exception as e: print(f"Error configuring GenAI in OrchestratorAgent: {e}")
 
 
-def _perform_reconciliation_logic_tool(invoice_data_json_str: str, po_data_json_str: str) -> dict:
-    
-    print(f"RECON_AGENT_TOOL: _perform_reconciliation_logic_tool called.")
+async def _get_shared_httpx_client() -> httpx.AsyncClient:
+    global shared_httpx_client
+    if shared_httpx_client is None or shared_httpx_client.is_closed:
+        print("INFO: Creating new shared httpx.AsyncClient instance.")
+        shared_httpx_client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0)) 
+    return shared_httpx_client
+
+async def _resolve_and_get_a2a_client(
+    http_client: httpx.AsyncClient,
+    agent_base_url: str,
+    target_agent_name_for_logging: str
+) -> Optional[Any]: 
+    if not A2ACardResolverClass or not DiscoveredA2AClientClass:
+        print(f"ERROR ({target_agent_name_for_logging}): A2ACardResolver or A2AClient class not available for dynamic discovery.")
+        return None
     try:
-        invoice_data_full = json.loads(invoice_data_json_str); po_data_full = json.loads(po_data_json_str)
-        if invoice_data_full.get("status") != "success": return {"status": "error", "error_message": "Invoice data invalid."}
-        if po_data_full.get("status") != "success": return {"status": "error", "error_message": "PO data invalid."}
-        invoice_data = invoice_data_full.get("data", {}); po_data = po_data_full.get("data", {})
-        discrepancies, matched_fields = [], []
-        inv_ref_po_num_raw = invoice_data.get("related_po_number"); inv_ref_po_num = inv_ref_po_num_raw.strip().upper() if inv_ref_po_num_raw and isinstance(inv_ref_po_num_raw, str) else None
-        actual_po_num_raw = po_data.get("document_number"); actual_po_num = actual_po_num_raw.strip().upper() if actual_po_num_raw and isinstance(actual_po_num_raw, str) else None
-        if inv_ref_po_num and actual_po_num and inv_ref_po_num == actual_po_num: matched_fields.append("po_number_reference_match")
-        elif actual_po_num and inv_ref_po_num: discrepancies.append(f"PO Mismatch: Inv PO '{inv_ref_po_num}' vs Actual PO '{actual_po_num}'.")
-        elif actual_po_num and not inv_ref_po_num : discrepancies.append(f"Missing PO Ref on Inv for PO '{actual_po_num}'.")
-        elif not actual_po_num: discrepancies.append("Critical: PO number missing in PO data.")
-        inv_vendor = invoice_data.get("vendor_name"); po_vendor = po_data.get("vendor_name")
-        if _compare_strings_fuzzy_local(inv_vendor, po_vendor): matched_fields.append("vendor_name")
-        else: discrepancies.append(f"Vendor Mismatch: Inv='{inv_vendor or 'N/A'}' vs PO='{po_vendor or 'N/A'}'")
-        inv_amount = invoice_data.get("total_amount"); po_amount = po_data.get("total_amount")
-        if _compare_amounts_local(inv_amount, po_amount): matched_fields.append("total_amount")
-        else: discrepancies.append(f"Amount Mismatch: Inv=${float(inv_amount or 0):.2f} vs PO=${float(po_amount or 0):.2f}")
-        inv_items = invoice_data.get("line_items", []); po_items = po_data.get("line_items", [])
-        if len(inv_items) == len(po_items) and (len(inv_items) > 0 or (len(inv_items)==0 and len(po_items)==0)): matched_fields.append("line_items_count")
-        else: discrepancies.append(f"Item Count Mismatch: Inv={len(inv_items)} vs PO={len(po_items)}")
-        total_key_fields = 4; match_percentage = (len(matched_fields) / total_key_fields * 100) if total_key_fields > 0 else 0
-        status_reco = "REJECTED"; recommendation = "Review details."
-        if not discrepancies: status_reco = "APPROVED"; recommendation = "Match."
-        elif "po_number_reference_match" not in matched_fields and inv_ref_po_num and actual_po_num and inv_ref_po_num != actual_po_num: status_reco = "REJECTED"; recommendation = "Critical PO ref mismatch."
-        elif not actual_po_num: status_reco = "REJECTED"; recommendation = "PO missing number."
-        elif match_percentage >= 75: status_reco = "NEEDS_REVIEW"; recommendation = f"High match ({match_percentage:.1f}%) with discrepancies."
-        else: recommendation = f"Low match ({match_percentage:.1f}%)."
-        inv_conf = float(invoice_data.get("confidence_score",0.5)); po_conf = float(po_data.get("confidence_score",0.5))
-        overall_conf = ((inv_conf+po_conf)/2*0.5) + ((match_percentage/100)*0.5)
-        return {"status": "success", "reconciliation_result": {"approval_status": status_reco, "match_percentage": round(match_percentage,1), "confidence_score": round(overall_conf,2), "matched_fields": matched_fields, "discrepancies": discrepancies, "recommendation": recommendation, "summary": {"invoice_number": invoice_data.get("document_number"), "po_number": po_data.get("document_number"), "invoice_total": inv_amount, "po_total": po_amount}}}
-    except json.JSONDecodeError as e: return {"status": "error", "error_message": f"Invalid JSON: {str(e)}"}
-    except Exception as e: print(f"ERROR: {e}\n{traceback.format_exc()}"); return {"status": "error", "error_message": f"Reco logic error: {str(e)}"}
+        print(f"ORCHESTRATOR: Resolving AgentCard for {target_agent_name_for_logging} at base URL: {agent_base_url}")
+        resolver = A2ACardResolverClass(httpx_client=http_client, base_url=agent_base_url)
+        agent_card_sdk_obj = await resolver.get_agent_card()
+        if agent_card_sdk_obj and agent_card_sdk_obj.url:
+            rpc_url = agent_card_sdk_obj.url
+            # Ensure RPC URL is absolute; if relative, combine with base_url (though AgentCard.url should be absolute)
+            if not rpc_url.startswith(('http://', 'https://')):
+                from urllib.parse import urljoin
+                rpc_url = urljoin(agent_base_url + ('/' if not agent_base_url.endswith('/') else ''), rpc_url.lstrip('/'))
+                print(f"ORCHESTRATOR: Constructed absolute RPC URL for {target_agent_name_for_logging}: {rpc_url}")
 
-reconciliation_llm_agent = LlmAgent(
-    name=reconciliation_agent_card.name, 
+            print(f"ORCHESTRATOR: Resolved AgentCard for {target_agent_name_for_logging}. RPC URL from card: {rpc_url}")
+            return DiscoveredA2AClientClass(httpx_client=http_client, url=rpc_url) # Use url from card
+        else:
+            err_msg = f"Failed to get a valid AgentCard or RPC URL from {agent_base_url}."
+            if agent_card_sdk_obj:
+                 err_msg += f" Card fetched but URL missing/invalid. Card content: {agent_card_sdk_obj.model_dump_json()}"
+            print(f"ERROR ({target_agent_name_for_logging}): {err_msg}")
+            return None
+    except Exception as e_resolve:
+        print(f"ERROR ({target_agent_name_for_logging}): Exception while resolving/fetching AgentCard from {agent_base_url}: {e_resolve}")
+        print(traceback.format_exc())
+        return None
+
+async def _orchestrate_po_reconciliation_tool(
+    po_number_input: str,
+    new_po_file_path: Optional[str] = None,
+    new_invoice_file_path: Optional[str] = None
+    ) -> dict:
+    print(f"ORCHESTRATOR_A2A_TOOL: po_number='{po_number_input}', "
+          f"new_po_file='{new_po_file_path}', new_inv_file='{new_invoice_file_path}'")
+
+    if not all([DiscoveredA2AClientClass, SendMessageRequest, MessageSendParams, Message, Part, Role, A2ACardResolverClass]):
+        return {
+            "status": "error",
+            "error_message": "A2A client components (Client, Resolver, Types) not initialized. Check imports."
+        }
+
+    http_client = await _get_shared_httpx_client()
+    final_report: Dict[str, Any] = {"steps_taken": [], "overall_status": "pending"}
+    po_extraction_full_obj: Optional[Dict[str, Any]] = None
+    invoice_extraction_full_obj: Optional[Dict[str, Any]] = None
+
+    po_number_to_process = po_number_input.strip().upper() if po_number_input else None
+    if not po_number_to_process:
+        return {"status": "error", "error_message": "PO number input is required."}
+
+    step_msg_po = f"Step 1: Acquiring PO '{po_number_to_process}'."
+    final_report["steps_taken"].append(step_msg_po); print(f"ORCHESTRATOR: {step_msg_po}")
+    po_from_db = get_po_by_number(po_number_to_process)
+    ingestion_response_dict = {}
+
+    if po_from_db:
+        po_extraction_full_obj = po_from_db
+        final_report["po_acquisition"] = {"status": "success_from_db", "source": "database", "doc_number": po_extraction_full_obj.get("data",{}).get("document_number")}
+        step_msg_po += " Found in database."
+    elif new_po_file_path:
+        step_msg_po += f" Not in DB. Delegating ingestion of new file '{new_po_file_path}'."
+        ingestion_tool_text = f"_ingest_and_store_document_tool: {json.dumps({'raw_document_file_path': new_po_file_path, 'document_type': 'purchase_order'})}"
+        
+        ingestion_agent_client = await _resolve_and_get_a2a_client(
+            http_client, DATA_INGESTION_AGENT_BASE_URL, "DataIngestionAgent (for PO)"
+        )
+        if not ingestion_agent_client:
+            ingestion_response_dict = {"status": "error", "error_message": "Failed to resolve or initialize client for Data Ingestion Agent (PO)."}
+        else:
+            try:
+                msg_parts_po = [Part(text=ingestion_tool_text)]
+                actual_msg_obj_po = Message(messageId=str(uuid.uuid4()), parts=msg_parts_po, role=Role.user)
+                msg_params_po = MessageSendParams(message=actual_msg_obj_po)
+                a2a_payload_po = SendMessageRequest(params=msg_params_po, id=str(uuid.uuid4()))
+                
+                print(f"ORCHESTRATOR: Sending A2A PO request via resolved client to {ingestion_agent_client.url if hasattr(ingestion_agent_client, 'url') else 'unknown URL'}")
+                ingestion_response_sdk_obj = await ingestion_agent_client.send_message(request=a2a_payload_po)
+                
+                if ingestion_response_sdk_obj and hasattr(ingestion_response_sdk_obj, 'message') and ingestion_response_sdk_obj.message and hasattr(ingestion_response_sdk_obj.message, 'parts') and ingestion_response_sdk_obj.message.parts:
+                    response_text = ingestion_response_sdk_obj.message.parts[0].text
+                    print(f"ORCHESTRATOR: Received A2A PO response: {response_text[:200]}...")
+                    ingestion_response_dict = json.loads(response_text)
+                elif ingestion_response_sdk_obj and hasattr(ingestion_response_sdk_obj, 'error') and ingestion_response_sdk_obj.error:
+                    ingestion_response_dict = {"status": "error", "error_message": f"A2A PO call failed - agent error: {ingestion_response_sdk_obj.error.details if hasattr(ingestion_response_sdk_obj.error, 'details') else ingestion_response_sdk_obj.error.message}"}
+                else:
+                    ingestion_response_dict = {"status": "error", "error_message": "A2A PO call failed - unexpected response structure"}
+            except pydantic.ValidationError as ve:
+                ingestion_response_dict = {"status": "error", "error_message": f"Pydantic validation error creating A2A PO request: {ve}"}
+                print(f"PYDANTIC ERROR (PO Ingestion): {ve}")
+            except json.JSONDecodeError as e:
+                ingestion_response_dict = {"status": "error", "error_message": f"Invalid JSON response from A2A (PO): {str(e)}"}
+            except Exception as e:
+                ingestion_response_dict = {"status": "error", "error_message": f"A2A PO communication error: {str(e)} \n{traceback.format_exc()}"}
+                print(traceback.format_exc())
+        
+        final_report["po_acquisition"] = ingestion_response_dict
+        if ingestion_response_dict.get("status") == "success":
+            po_extraction_full_obj = ingestion_response_dict.get("full_extraction_result")
+            if po_extraction_full_obj and isinstance(po_extraction_full_obj, dict):
+                extracted_po_num_obj = po_extraction_full_obj.get("data",{}).get("document_number")
+                extracted_po_num = str(extracted_po_num_obj).strip().upper() if extracted_po_num_obj is not None else ""
+                if extracted_po_num and extracted_po_num != po_number_to_process:
+                    step_msg_po += f" File extracted as PO '{extracted_po_num}'. Using this."
+                    po_number_to_process = extracted_po_num
+                step_msg_po += f" Successfully ingested new PO as '{po_number_to_process}' via A2A."
+            else:
+                ingestion_response_dict["status"] = "error"
+                ingestion_response_dict["error_message"] = "A2A PO ingestion succeeded but response format was unexpected."
+                final_report["overall_status"] = "error"; final_report["error_message"] = ingestion_response_dict["error_message"]
+                final_report["steps_taken"].append(step_msg_po + " - Error in response format"); print(f"ORCHESTRATOR: {step_msg_po} - Error in response format"); return final_report
+        else:
+            final_report["overall_status"] = "error"; final_report["error_message"] = f"A2A PO ingestion failed: {ingestion_response_dict.get('error_message', 'Unknown error')}"
+            final_report["steps_taken"].append(step_msg_po); print(f"ORCHESTRATOR: {step_msg_po} - Error"); return final_report
+    else:
+        step_msg_po += f" PO '{po_number_to_process}' not found in DB and no new file provided."
+        final_report["overall_status"] = "po_not_found_needs_file"; final_report["message_to_user"] = step_msg_po
+        final_report["required_next_input"] = "new_po_file_path"; final_report["context_po_number"] = po_number_to_process
+        final_report["steps_taken"].append(step_msg_po); print(f"ORCHESTRATOR: {step_msg_po}"); return final_report
+
+    final_report["steps_taken"].append(step_msg_po); print(f"ORCHESTRATOR: {step_msg_po}")
+
+    if not po_extraction_full_obj:
+        final_report["overall_status"] = "error"; final_report["error_message"] = "Critical: PO data object is missing after acquisition attempts."
+        return final_report
+
+    confirmed_po_number = ""
+    if isinstance(po_extraction_full_obj, dict) and "data" in po_extraction_full_obj:
+        confirmed_po_number = str(po_extraction_full_obj.get("data", {}).get("document_number", "")).strip().upper()
+    if not confirmed_po_number and po_number_to_process :
+         confirmed_po_number = po_number_to_process
+    if not confirmed_po_number:
+        final_report["overall_status"] = "error"; final_report["error_message"] = "Critical: PO number missing or could not be confirmed after acquisition."
+        return final_report
+
+    
+    step_msg_inv = f"Step 2: Acquiring Invoice related to PO '{confirmed_po_number}'."
+    final_report["steps_taken"].append(step_msg_inv); print(f"ORCHESTRATOR: {step_msg_inv}")
+    ingestion_response_dict_inv = {}
+
+    if new_invoice_file_path:
+        step_msg_inv += f" Delegating ingestion of new invoice file '{new_invoice_file_path}'."
+        invoice_tool_text = f"_ingest_and_store_document_tool: {json.dumps({'raw_document_file_path': new_invoice_file_path, 'document_type': 'invoice'})}"
+        
+        ingestion_agent_client_for_invoice = await _resolve_and_get_a2a_client(
+            http_client, DATA_INGESTION_AGENT_BASE_URL, "DataIngestionAgent (for Invoice)"
+        )
+        if not ingestion_agent_client_for_invoice:
+            ingestion_response_dict_inv = {"status": "error", "error_message": "Failed to resolve or initialize client for Data Ingestion Agent (Invoice)."}
+        else:
+            try:
+                msg_parts_inv = [Part(text=invoice_tool_text)]
+                actual_msg_obj_inv = Message(messageId=str(uuid.uuid4()), parts=msg_parts_inv, role=Role.user)
+                msg_params_inv = MessageSendParams(message=actual_msg_obj_inv)
+                a2a_payload_inv = SendMessageRequest(params=msg_params_inv, id=str(uuid.uuid4()))
+                
+                print(f"ORCHESTRATOR: Sending A2A invoice request via resolved client to {ingestion_agent_client_for_invoice.url if hasattr(ingestion_agent_client_for_invoice, 'url') else 'unknown URL'}")
+                ingestion_response_inv_sdk_obj = await ingestion_agent_client_for_invoice.send_message(request=a2a_payload_inv)
+
+                if ingestion_response_inv_sdk_obj and hasattr(ingestion_response_inv_sdk_obj, 'message') and ingestion_response_inv_sdk_obj.message and hasattr(ingestion_response_inv_sdk_obj.message, 'parts') and ingestion_response_inv_sdk_obj.message.parts:
+                    response_text_inv = ingestion_response_inv_sdk_obj.message.parts[0].text
+                    print(f"ORCHESTRATOR: Received A2A invoice response: {response_text_inv[:200]}...")
+                    ingestion_response_dict_inv = json.loads(response_text_inv)
+                elif ingestion_response_inv_sdk_obj and hasattr(ingestion_response_inv_sdk_obj, 'error') and ingestion_response_inv_sdk_obj.error:
+                    ingestion_response_dict_inv = {"status": "error", "error_message": f"A2A Invoice call failed - agent error: {ingestion_response_inv_sdk_obj.error.details if hasattr(ingestion_response_inv_sdk_obj.error, 'details') else ingestion_response_inv_sdk_obj.error.message}"}
+                else:
+                    ingestion_response_dict_inv = {"status": "error", "error_message": "A2A Invoice call failed - unexpected response structure"}
+            except pydantic.ValidationError as ve:
+                ingestion_response_dict_inv = {"status": "error", "error_message": f"Pydantic validation error creating A2A Invoice request: {ve}"}
+                print(f"PYDANTIC ERROR (Invoice Ingestion): {ve}")
+            except json.JSONDecodeError as e:
+                ingestion_response_dict_inv = {"status": "error", "error_message": f"Invalid JSON response from A2A (Invoice): {str(e)}"}
+            except Exception as e:
+                ingestion_response_dict_inv = {"status": "error", "error_message": f"A2A Invoice communication error: {str(e)} \n{traceback.format_exc()}"}
+                print(traceback.format_exc())
+
+        final_report["invoice_acquisition"] = ingestion_response_dict_inv
+        if ingestion_response_dict_inv.get("status") == "success":
+            invoice_extraction_full_obj = ingestion_response_dict_inv.get("full_extraction_result")
+            if not (invoice_extraction_full_obj and isinstance(invoice_extraction_full_obj, dict)):
+                 ingestion_response_dict_inv["status"] = "error"
+                 ingestion_response_dict_inv["error_message"] = "A2A Invoice ingestion succeeded but response format was unexpected."
+                 final_report["overall_status"] = "error"; final_report["error_message"] = ingestion_response_dict_inv["error_message"]
+                 final_report["steps_taken"].append(step_msg_inv + " - Error in response format"); print(f"ORCHESTRATOR: {step_msg_inv} - Error in response format"); return final_report
+            step_msg_inv += " Successfully ingested new invoice via A2A."
+        else:
+            final_report["overall_status"] = "error"; final_report["error_message"] = f"A2A Invoice ingestion failed: {ingestion_response_dict_inv.get('error_message', 'Unknown error')}"
+            final_report["steps_taken"].append(step_msg_inv); print(f"ORCHESTRATOR: {step_msg_inv} - Error"); return final_report
+    else:
+        step_msg_inv += f" Searching DB for invoice related to PO '{confirmed_po_number}'."
+        invoice_extraction_full_obj = get_invoice_by_related_po(confirmed_po_number)
+        if invoice_extraction_full_obj:
+            inv_num_found_obj = invoice_extraction_full_obj.get('data',{}).get('document_number', 'UNKNOWN')
+            inv_num_found = str(inv_num_found_obj)
+            step_msg_inv += f" Found related invoice '{inv_num_found}' in DB."
+            final_report["invoice_acquisition"] = {"status": "success_from_db_related_to_po", "source": "database", "document_number": inv_num_found}
+        else:
+            step_msg_inv += f" No related invoice found in DB for PO '{confirmed_po_number}'."
+            final_report["overall_status"] = "po_secured_invoice_needed"; final_report["message_to_user"] = step_msg_inv
+            final_report["required_next_input"] = "new_invoice_file_path"; final_report["context_po_number"] = confirmed_po_number
+            final_report["steps_taken"].append(step_msg_inv); print(f"ORCHESTRATOR: {step_msg_inv}"); return final_report
+
+    final_report["steps_taken"].append(step_msg_inv); print(f"ORCHESTRATOR: {step_msg_inv}")
+
+    if not invoice_extraction_full_obj:
+        final_report["overall_status"] = "error"; final_report["error_message"] = "Valid Invoice data not obtained."
+        return final_report
+
+    
+    step_msg_reco = f"Step 3: Delegating reconciliation to ReconciliationAgent."
+    final_report["steps_taken"].append(step_msg_reco); print(f"ORCHESTRATOR: {step_msg_reco}")
+    reco_response_dict = {}
+    reco_tool_invocation_text = f"_perform_reconciliation_logic_tool: {json.dumps({'invoice_data_json_str': json.dumps(invoice_extraction_full_obj), 'po_data_json_str': json.dumps(po_extraction_full_obj)})}"
+    
+    reco_agent_client = await _resolve_and_get_a2a_client(
+        http_client, RECONCILIATION_AGENT_BASE_URL, "ReconciliationAgent"
+    )
+    if not reco_agent_client:
+        reco_response_dict = {"status": "error", "error_message": "Failed to resolve or initialize client for Reconciliation Agent."}
+    else:
+        try:
+            msg_parts_reco = [Part(text=reco_tool_invocation_text)]
+            actual_msg_obj_reco = Message(messageId=str(uuid.uuid4()), parts=msg_parts_reco, role=Role.user)
+            msg_params_reco = MessageSendParams(message=actual_msg_obj_reco)
+            a2a_payload_reco = SendMessageRequest(params=msg_params_reco, id=str(uuid.uuid4()))
+            
+            print(f"ORCHESTRATOR: Sending A2A reconciliation request via resolved client to {reco_agent_client.url if hasattr(reco_agent_client, 'url') else 'unknown URL'}")
+            reco_response_sdk_obj = await reco_agent_client.send_message(request=a2a_payload_reco)
+
+            if reco_response_sdk_obj and hasattr(reco_response_sdk_obj, 'message') and reco_response_sdk_obj.message and hasattr(reco_response_sdk_obj.message, 'parts') and reco_response_sdk_obj.message.parts:
+                response_text_reco = reco_response_sdk_obj.message.parts[0].text
+                print(f"ORCHESTRATOR: Received A2A reconciliation response: {response_text_reco[:200]}...")
+                reco_response_dict = json.loads(response_text_reco)
+            elif reco_response_sdk_obj and hasattr(reco_response_sdk_obj, 'error') and reco_response_sdk_obj.error:
+                reco_response_dict = {"status": "error", "error_message": f"A2A Reconciliation call failed - agent error: {reco_response_sdk_obj.error.details if hasattr(reco_response_sdk_obj.error, 'details') else reco_response_sdk_obj.error.message}"}
+            else:
+                reco_response_dict = {"status": "error", "error_message": "A2A Reconciliation call failed - unexpected response structure"}
+        except pydantic.ValidationError as ve:
+            reco_response_dict = {"status": "error", "error_message": f"Pydantic validation error creating A2A Reconciliation request: {ve}"}
+            print(f"PYDANTIC ERROR (Reconciliation): {ve}")
+        except json.JSONDecodeError as e:
+            reco_response_dict = {"status": "error", "error_message": f"Invalid JSON response from A2A (Reconciliation): {str(e)}"}
+        except Exception as e:
+            reco_response_dict = {"status": "error", "error_message": f"A2A Reconciliation communication error: {str(e)} \n{traceback.format_exc()}"}
+            print(traceback.format_exc())
+
+    final_report["reconciliation_report"] = reco_response_dict
+    if reco_response_dict.get("status") == "success":
+        final_report["overall_status"] = "success_reconciled"; final_report["message"] = "Reconciliation complete."
+    else:
+        final_report["overall_status"] = "error_in_reconciliation"; final_report["error_message"] = f"Reconciliation failed: {reco_response_dict.get('error_message', 'Unknown error')}"
+    return final_report
+
+async def close_shared_httpx_client():
+    global shared_httpx_client
+    if shared_httpx_client and not shared_httpx_client.is_closed:
+        print("INFO: Closing shared httpx.AsyncClient instance.")
+        await shared_httpx_client.aclose()
+    shared_httpx_client = None
+
+# Ensure orchestrator_agent_card_instance is defined before LlmAgent initialization
+if orchestrator_agent_card_instance is None:
+     print("CRITICAL ERROR: orchestrator_agent_card_instance could not be defined using a2a.types or was not imported. Agent cannot start correctly.")
+     root_agent_name = "orchestrator_agent_emergency_fallback"
+     root_agent_description = "Orchestrator agent running in a degraded state due to missing or failed AgentCard definition."
+elif orchestrator_agent_card_instance: # Check if it's not None
+    root_agent_name = orchestrator_agent_card_instance.name
+    root_agent_description = orchestrator_agent_card_instance.description
+else: # This case should ideally not be hit if the above logic is sound
+    print("CRITICAL ERROR: Fallback case - orchestrator_agent_card_instance is in an unexpected state (neither None nor a valid card).")
+    root_agent_name = "orchestrator_agent_undefined_state"
+    root_agent_description = "Orchestrator agent in undefined state."
+
+
+root_agent = LlmAgent(
+    name=root_agent_name,
     model=os.getenv("ADK_MODEL", "gemini-1.5-flash-latest"),
-    description=reconciliation_agent_card.description,
+    description=root_agent_description,
     instruction=(
-        "You are a Reconciliation Specialist. An Orchestrator Agent will send you a message "
-        "effectively asking you to call your `_perform_reconciliation_logic_tool`. "
-        "The message will contain `invoice_data_json_str` and `po_data_json_str` arguments.\n"
-        "Your ONLY task is to use this tool with the provided JSON strings "
-        "and return its complete JSON result. Do not add conversational fluff."
+        "You are the Vendor Reconciliation Orchestrator. Your primary goal is to reconcile an invoice with a Purchase Order (PO).\n\n"
+        "**Your Main Tool:** `_orchestrate_po_reconciliation_tool`.\n\n"
+        "**Interaction Flow & Logic:**\n"
+        "1.  **Start:** Greet the user. Ask: 'Hello! Are you working with **new documents** you'd like to upload, or do you want to reconcile based on an **existing Purchase Order (PO) number** already in our system?'\n"
+        "2.  **Handle User's Initial Choice:**\n"
+        "    A.  If user indicates **'Existing PO'** or provides a PO number directly:\n"
+        "        - Get the `po_number_input` from the user.\n"
+        "        - Call `_orchestrate_po_reconciliation_tool` with just this `po_number_input`.\n"
+        "    B.  If user indicates **'New Documents'** (implying new PO and likely new Invoice):\n"
+        "        - Ask for the `new_po_file_path` (full local path to the new PO document).\n"
+        "        - (Optional but good: you can ask for a target PO number they have in mind for this file, or let the tool extract it. For the tool, `po_number_input` can be omitted if `new_po_file_path` is given and the number is to be extracted from the file itself.)\n"
+        "        - Then, ask for the `new_invoice_file_path` (full local path for the corresponding new invoice).\n"
+        "        - Call `_orchestrate_po_reconciliation_tool` with `new_po_file_path` and `new_invoice_file_path` (and `po_number_input` if you asked for a target PO number for the new PO file).\n"
+        "3.  **Interpret Tool Response & Follow Up (Iterative Process):**\n"
+        "    The `_orchestrate_po_reconciliation_tool` tool will return a JSON response. Examine its `overall_status` and `context_po_number` (if present).\n"
+        "    a.  If tool response has `overall_status: \"po_not_found_needs_file\"`:\n"
+        "        - The tool provides `context_po_number`. Ask the user: 'PO \"[Value from tool's context_po_number]\" was not found. Please provide the full local file path for this new PO document.'\n"
+        "        - Once user provides `new_po_file_path`: Call `_orchestrate_po_reconciliation_tool` tool AGAIN. Pass the `po_number_input` (which is `context_po_number` from previous tool response) AND the newly provided `new_po_file_path`.\n"
+        "    b.  If tool response has `overall_status: \"po_secured_invoice_needed\"` (PO found/ingested, but no related invoice found in DB automatically):\n"
+        "        - The tool provides `context_po_number`. Ask the user: 'PO \"[Value from tool's context_po_number]\" has been processed/found. However, no related invoice was found in the database. Do you have a new invoice file to upload for this PO? If yes, please provide its full local file path.'\n"
+        "        - Once user provides `new_invoice_file_path`: Call `_orchestrate_po_reconciliation_tool` tool AGAIN. Pass the `po_number_input` (which is `context_po_number` from previous tool response) AND the newly provided `new_invoice_file_path`.\n"
+        "    c.  If tool response indicates `overall_status: \"success_reconciled\"` or any other final status (e.g., `error`, `partial_success_..._only`):\n"
+        "        - Present the full results (including `steps_taken`, `message_to_user` if any, and `reconciliation_report` if present from the tool's JSON response) clearly to the user.\n"
+        "4.  **Clarity for File Paths:** Always request FULL LOCAL FILE PATHS.\n\n"
+        "**Goal:** Guide the user to provide information step-by-step so you can eventually call `_orchestrate_po_reconciliation_tool` with enough arguments for it to either complete the reconciliation or return a status asking for the next specific piece of missing information (which you then ask the user for)."
     ),
-    tools=[_perform_reconciliation_logic_tool]
+    tools=[
+        _orchestrate_po_reconciliation_tool
+    ]
 )
-
-root_agent = reconciliation_llm_agent

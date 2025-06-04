@@ -4,46 +4,55 @@ from typing import Dict, Any, Optional, List
 from google.adk.agents.llm_agent import LlmAgent
 from dotenv import load_dotenv
 import traceback
-import httpx # Import httpx
-import uuid # For generating messageId
-import pydantic # To catch pydantic.ValidationError
+import asyncio
+import httpx
+import uuid
+import pydantic
 
 import sys
 project_root_orch = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root_orch not in sys.path: sys.path.insert(0, project_root_orch)
 
+# A2A Type Placeholders - these will be overwritten by imports from a2a.types
 DiscoveredA2AClientClass = None
 SendMessageRequest, MessageSendParams, Message, Part, Task, Role = None, None, None, None, None, None
-A2AAgentCard, SendMessageResponse, SendMessageSuccessResponse = None, None, None
+# Specific types for AgentCard structure - these will be directly imported if available
+AgentCapabilities, AgentSkill, AgentCard = None, None, None # Using original names
+
+
 
 shared_httpx_client: Optional[httpx.AsyncClient] = None
 
 try:
-    from a2a.client.client import A2AClient as ActualDiscoveredClient
+    from a2a.client.client import A2AClient 
+    
     from a2a.types import (
-        SendMessageRequest as TypesSMR,
-        MessageSendParams as TypesMSP,
-        Message as TypesMessage, # Import Message
-        Part as TypesPart,
-        Task as TypesTask,
-        Role as TypesRole, # Import Role
-        AgentCard as TypesA2AAgentCard,
-        SendMessageResponse as TypesSMResponse,
-        SendMessageSuccessResponse as TypesSMSuccessResponse, # Assuming this exists
+        SendMessageRequest, # Original nme
+        MessageSendParams,  # Original name
+        Message,            # Original name
+        Part,               # Original name
+        Task,               # Original name
+        Role,               # Original name
+        AgentCard,          
+        AgentCapabilities,  
+        AgentSkill,         
+        
+        
     )
 
-    DiscoveredA2AClientClass = ActualDiscoveredClient
-    SendMessageRequest, MessageSendParams, Message, Part, Task, Role = \
-        TypesSMR, TypesMSP, TypesMessage, TypesPart, TypesTask, TypesRole
-    A2AAgentCard = TypesA2AAgentCard
-    SendMessageResponse, SendMessageSuccessResponse = TypesSMResponse, TypesSMSuccessResponse
-
-    print("SUCCESS: Client from 'a2a.client.client' and types from 'a2a.types' imported.")
+    DiscoveredA2AClientClass = A2AClient 
+    
+    print("SUCCESS: Client and types (AgentCard, AgentCapabilities, AgentSkill, etc.) from 'a2a.types' imported.")
 
 except ImportError as e:
-    print(f"ERROR: Could not import client from 'a2a.client.client' or types from 'a2a.types': {e}")
+    print(f"ERROR: Could not import client or all necessary types from 'a2a.types': {e}")
     print("       A2A functionality will be severely impaired or unavailable.")
     
+    DiscoveredA2AClientClass = None
+    SendMessageRequest, MessageSendParams, Message, Part, Task, Role = None, None, None, None, None, None
+    AgentCapabilities, AgentSkill, AgentCard = None, None, None
+   
+
 
 from database_manager import get_invoice_by_number, get_po_by_number, get_invoice_by_related_po
 import google.generativeai as genai
@@ -51,86 +60,50 @@ import google.generativeai as genai
 ORCH_AGENT_HOST = os.getenv("ORCH_AGENT_HOST", "localhost")
 ORCH_AGENT_PORT = int(os.getenv("ORCH_AGENT_PORT", 8000))
 
-class AgentCapability:
-    def __init__(self, name: str, description: str, input_schema=None, output_schema=None):
-        self.name = name
-        self.description = description
+# Custom class definitions for AgentCapability, AgentSkill, AgentCard ARE REMOVED
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {"name": self.name, "description": self.description}
+# Define orchestrator_agent_card using a2a.types
+orchestrator_agent_card_instance = None # Use a different name for the instance
 
-class AgentSkill:
-    def __init__(self, name: str, description: str, capabilities: List[AgentCapability]):
-        self.name = name
-        self.description = description
-        self.capabilities = capabilities
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "name": self.name,
-            "description": self.description,
-            "capabilities": [cap.to_dict() for cap in self.capabilities]
-        }
+if AgentCard and AgentCapabilities and AgentSkill: # Check if the classes were imported
+    try:
+        # 1. Define the skill (using a2a.types.AgentSkill)
+        orchestrator_main_skill_obj = AgentSkill( # Use original class name AgentSkill
+            id="reconciliation_orchestration_skill",
+            name="Reconciliation Orchestration",
+            description="Coordinates data ingestion and reconciliation sub-tasks for purchase orders and invoices.",
+            tags=["orchestration", "reconciliation", "finance"]
+        )
 
-class AgentCard:
-    def __init__(self, name: str, description: str, url: str, version: str,
-                 defaultInputModes: List[str], defaultOutputModes: List[str],
-                 capabilities: List[AgentCapability],
-                 skills: List[AgentSkill]):
-        self.name = name
-        self.description = description
-        self.url = url
-        self.version = version
-        self.defaultInputModes = defaultInputModes
-        self.defaultOutputModes = defaultOutputModes
-        self.capabilities = capabilities
-        self.skills = skills
+      
+        orchestrator_broad_capabilities_obj = AgentCapabilities( 
+            pushNotifications=False,
+            stateTransitionHistory=True,
+            streaming=False
+        )
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "name": self.name,
-            "description": self.description,
-            "url": self.url,
-            "version": self.version,
-            "defaultInputModes": self.defaultInputModes,
-            "defaultOutputModes": self.defaultOutputModes,
-            "capabilities": [cap.to_dict() for cap in self.capabilities],
-            "skills": [skill.to_dict() for skill in self.skills]
-        }
-
-    def to_a2a_agent_card(self) -> Optional[Any]:
-        """Convert to A2A AgentCard format (from a2a.types)"""
-        if not A2AAgentCard:
-            print("WARN: a2a.types.AgentCard class not available. Cannot create A2A AgentCard.")
-            return None
         
-        try:
-            return A2AAgentCard(
-                name=self.name,
-                description=self.description,
-                url=self.url,
-                version=self.version,
-                defaultInputModes=self.defaultInputModes,
-                defaultOutputModes=self.defaultOutputModes
-                
-            )
-        except Exception as card_ex:
-            print(f"Error creating a2a.types.AgentCard: {card_ex}")
-            return None
+        orchestrator_agent_card_instance = AgentCard( 
+            name="vendor_reconciliation_orchestrator_a2a",
+            description="Main orchestrator AI agent for vendor reconciliation via A2A.",
+            url=f"http://{ORCH_AGENT_HOST}:{ORCH_AGENT_PORT}/invoke",
+            version="1.0.0",
+            defaultInputModes=["text/plain"],
+            defaultOutputModes=["application/json"],
+            capabilities=orchestrator_broad_capabilities_obj, 
+            skills=[orchestrator_main_skill_obj]              
+        )
+        print(f"ORCHESTRATOR_AGENT: Defined AgentCard using a2a.types: {orchestrator_agent_card_instance.model_dump_json(indent=2)}")
 
+    except pydantic.ValidationError as ve_card:
+        print(f"PYDANTIC VALIDATION ERROR creating orchestrator_agent_card_instance: {ve_card}")
+        orchestrator_agent_card_instance = None
+    except Exception as e_card:
+        print(f"ERROR creating orchestrator_agent_card_instance using a2a.types: {e_card}")
+        orchestrator_agent_card_instance = None
+else:
+    print("WARN: SDK types AgentCard, AgentCapabilities, or AgentSkill not imported. Orchestrator agent card not defined.")
 
-orchestrator_capability = AgentCapability(name="_orchestrate_po_reconciliation_tool", description="Manages the PO-centric reconciliation workflow.")
-orchestrator_skill = AgentSkill(name="Reconciliation Orchestration", description="Coordinates data ingestion and reconciliation sub-tasks.", capabilities=[orchestrator_capability])
-
-orchestrator_agent_card = AgentCard(
-    name="vendor_reconciliation_orchestrator_a2a",
-    description="Main orchestrator AI agent for vendor reconciliation via A2A.",
-    url=f"http://{ORCH_AGENT_HOST}:{ORCH_AGENT_PORT}/invoke",
-    version="1.0.0",
-    defaultInputModes=["text/plain"], defaultOutputModes=["application/json"],
-    capabilities=[], skills=[orchestrator_skill]
-)
-
-print(f"ORCHESTRATOR_AGENT: Defined AgentCard: {json.dumps(orchestrator_agent_card.to_dict(), indent=2)}")
 
 DATA_INGESTION_AGENT_URL = f"http://{os.getenv('DATA_INGESTION_AGENT_HOST', 'localhost')}:{int(os.getenv('DATA_INGESTION_AGENT_PORT', 8001))}/invoke"
 RECONCILIATION_AGENT_URL = f"http://{os.getenv('RECON_AGENT_HOST', 'localhost')}:{int(os.getenv('RECON_AGENT_PORT', 8002))}/invoke"
@@ -160,7 +133,7 @@ async def _orchestrate_po_reconciliation_tool(
     if not all([DiscoveredA2AClientClass, SendMessageRequest, MessageSendParams, Message, Part, Role]):
         return {
             "status": "error",
-            "error_message": "A2A client components or types (Client, SMR, MSP, Message, Part, Role) not initialized. Check imports."
+            "error_message": "A2A client components or core types not initialized. Check imports."
         }
 
     http_client = await _get_shared_httpx_client()
@@ -192,7 +165,7 @@ async def _orchestrate_po_reconciliation_tool(
                 role=Role.user
             )
             msg_params_po = MessageSendParams(message=actual_msg_obj_po)
-            a2a_payload_po = SendMessageRequest(params=msg_params_po, id=str(uuid.uuid4())) # MODIFIED: Added 'params=', optionally 'id='
+            a2a_payload_po = SendMessageRequest(params=msg_params_po, id=str(uuid.uuid4()))
             ingestion_agent_client = DiscoveredA2AClientClass(httpx_client=http_client, url=DATA_INGESTION_AGENT_URL)
             print(f"ORCHESTRATOR: Sending A2A PO request to {DATA_INGESTION_AGENT_URL}")
             ingestion_response_sdk_obj = await ingestion_agent_client.send_message(request=a2a_payload_po)
@@ -262,7 +235,7 @@ async def _orchestrate_po_reconciliation_tool(
                 role=Role.user
             )
             msg_params_inv = MessageSendParams(message=actual_msg_obj_inv)
-            a2a_payload_inv = SendMessageRequest(params=msg_params_inv, id=str(uuid.uuid4())) # MODIFIED: Added 'params=', optionally 'id='
+            a2a_payload_inv = SendMessageRequest(params=msg_params_inv, id=str(uuid.uuid4()))
             invoice_agent_client = DiscoveredA2AClientClass(httpx_client=http_client, url=DATA_INGESTION_AGENT_URL)
             print(f"ORCHESTRATOR: Sending A2A invoice request to {DATA_INGESTION_AGENT_URL}")
             ingestion_response_inv_sdk_obj = await invoice_agent_client.send_message(request=a2a_payload_inv)
@@ -324,7 +297,7 @@ async def _orchestrate_po_reconciliation_tool(
             role=Role.user
         )
         msg_params_reco = MessageSendParams(message=actual_msg_obj_reco)
-        a2a_payload_reco = SendMessageRequest(params=msg_params_reco, id=str(uuid.uuid4())) # MODIFIED: Added 'params=', optionally 'id='
+        a2a_payload_reco = SendMessageRequest(params=msg_params_reco, id=str(uuid.uuid4()))
         reco_agent_client = DiscoveredA2AClientClass(httpx_client=http_client, url=RECONCILIATION_AGENT_URL)
         print(f"ORCHESTRATOR: Sending A2A reconciliation request to {RECONCILIATION_AGENT_URL}")
         reco_response_sdk_obj = await reco_agent_client.send_message(request=a2a_payload_reco)
@@ -358,10 +331,24 @@ async def close_shared_httpx_client():
         await shared_httpx_client.aclose()
     shared_httpx_client = None
 
+
+if orchestrator_agent_card_instance is None:
+     print("CRITICAL ERROR: orchestrator_agent_card_instance could not be defined using a2a.types or was not imported. Agent cannot start correctly.")
+     root_agent_name = "orchestrator_agent_emergency_fallback"
+     root_agent_description = "Orchestrator agent running in a degraded state due to missing or failed AgentCard definition."
+elif orchestrator_agent_card_instance: # Check if it's not None
+    root_agent_name = orchestrator_agent_card_instance.name
+    root_agent_description = orchestrator_agent_card_instance.description
+else: # This case should ideally not be hit if the above logic is sound
+    print("CRITICAL ERROR: Fallback case - orchestrator_agent_card_instance is in an unexpected state (neither None nor a valid card).")
+    root_agent_name = "orchestrator_agent_undefined_state"
+    root_agent_description = "Orchestrator agent in undefined state."
+
+
 root_agent = LlmAgent(
-    name=orchestrator_agent_card.name,
+    name=root_agent_name,
     model=os.getenv("ADK_MODEL", "gemini-1.5-flash-latest"),
-    description=orchestrator_agent_card.description,
+    description=root_agent_description,
     instruction=(
         "You are the Vendor Reconciliation Orchestrator. Your primary goal is to reconcile an invoice with a Purchase Order (PO).\n\n"
         "**Your Main Tool:** `_orchestrate_po_reconciliation_tool`.\n\n"
