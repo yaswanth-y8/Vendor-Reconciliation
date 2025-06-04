@@ -20,7 +20,7 @@ def initialize_database():
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # Invoices Table
+    
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS invoices (
             invoice_number TEXT PRIMARY KEY,
@@ -32,13 +32,13 @@ def initialize_database():
             stored_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    # Create an index on related_po_number for faster lookups
+    
     cursor.execute('''
         CREATE INDEX IF NOT EXISTS idx_invoices_related_po
         ON invoices (related_po_number)
     ''')
     
-    # Purchase Orders Table
+
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS purchase_orders (
             po_number TEXT PRIMARY KEY,
@@ -55,8 +55,7 @@ def initialize_database():
     conn.close()
     print(f"DB_MGR: Database '{DB_PATH}' initialized/checked successfully.")
 
-# Call initialize_database when the module is first imported
-# This ensures tables and indexes are ready.
+
 initialize_database()
 
 def store_invoice_data(invoice_number: str, extracted_invoice_data: Dict[str, Any]) -> bool:
@@ -81,7 +80,7 @@ def store_invoice_data(invoice_number: str, extracted_invoice_data: Dict[str, An
             data_to_insert.get("date"), 
             data_to_insert.get("total_amount"),
             str(data_to_insert.get("related_po_number","")).strip().upper() if data_to_insert.get("related_po_number") else None, # Ensure uppercase or None
-            json.dumps(extracted_invoice_data), # Store the whole original extraction result
+            json.dumps(extracted_invoice_data), 
             datetime.now().isoformat()
         ))
         conn.commit()

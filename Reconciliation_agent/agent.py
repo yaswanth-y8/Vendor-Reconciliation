@@ -1,13 +1,10 @@
-# reconciliation_processing_agent/agent.py
 import os
 import json
 from typing import Dict, Any, Optional,List
 from google.adk.agents.llm_agent import LlmAgent
-# from google.adk import AgentCard # Hypothetical
-# from a2a.types import Part # Hypothetical
 import traceback
 
-# Path setup
+
 import sys
 project_root_rc = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root_rc not in sys.path: sys.path.insert(0, project_root_rc)
@@ -17,40 +14,35 @@ from difflib import SequenceMatcher
 import re 
 import google.generativeai as genai
 
-# ---- AgentCard Definition (Hypothetical) ----
+
 RECON_AGENT_HOST = os.getenv("RECON_AGENT_HOST", "localhost")
-RECON_AGENT_PORT = int(os.getenv("RECON_AGENT_PORT", 8002)) # Example port
+RECON_AGENT_PORT = int(os.getenv("RECON_AGENT_PORT", 8002)) 
 
-# In orchestrator_agent/agent.py
-# In data_ingestion_agent/agent.py
-# In reconciliation_processing_agent/agent.py
 
-# --- Start Hypothetical AgentCard and related types ---
-class AgentCapability: # Mock
+class AgentCapability: 
     def __init__(self, name: str, description: str, input_schema=None, output_schema=None):
         self.name = name
         self.description = description
-        # self.input_schema = input_schema # Store if needed for to_dict
-        # self.output_schema = output_schema # Store if needed for to_dict
-    def to_dict(self) -> Dict[str, Any]: # ADDED
+        
+    def to_dict(self) -> Dict[str, Any]: 
         return {"name": self.name, "description": self.description}
 
-class AgentSkill: # Mock
+class AgentSkill: 
     def __init__(self, name: str, description: str, capabilities: List[AgentCapability]):
         self.name = name
         self.description = description
         self.capabilities = capabilities
-    def to_dict(self) -> Dict[str, Any]: # ADDED
+    def to_dict(self) -> Dict[str, Any]: 
         return {
             "name": self.name, 
             "description": self.description, 
             "capabilities": [cap.to_dict() for cap in self.capabilities]
         }
 
-class AgentCard: # Mock
+class AgentCard: 
     def __init__(self, name: str, description: str, url: str, version: str, 
                  defaultInputModes: List[str], defaultOutputModes: List[str], 
-                 capabilities: List[AgentCapability], # Assuming top-level capabilities
+                 capabilities: List[AgentCapability], 
                  skills: List[AgentSkill]):
         self.name = name
         self.description = description
@@ -58,10 +50,10 @@ class AgentCard: # Mock
         self.version = version
         self.defaultInputModes = defaultInputModes
         self.defaultOutputModes = defaultOutputModes
-        self.capabilities = capabilities # List of AgentCapability objects
-        self.skills = skills # List of AgentSkill objects
+        self.capabilities = capabilities 
+        self.skills = skills 
 
-    def to_dict(self) -> Dict[str, Any]: # ADDED
+    def to_dict(self) -> Dict[str, Any]: 
         return {
             "name": self.name,
             "description": self.description,
@@ -85,17 +77,17 @@ reco_skill = AgentSkill(
 )
 
 reconciliation_agent_card = AgentCard(
-    name="reconciliation_specialist_agent", # Must match name used by orchestrator
+    name="reconciliation_specialist_agent", 
     description="Specialized agent for comparing invoice and PO data.",
-    url=f"http://{RECON_AGENT_HOST}:{RECON_AGENT_PORT}/invoke", # ADK endpoint
+    url=f"http://{RECON_AGENT_HOST}:{RECON_AGENT_PORT}/invoke", 
     version="1.0.0",
-    defaultInputModes=["application/json"], # Expects JSON in A2A call
+    defaultInputModes=["application/json"], 
     defaultOutputModes=["application/json"],
     capabilities=[],
     skills=[reco_skill]
 )
 print(f"RECONCILIATION_AGENT: Defined AgentCard: {json.dumps(reconciliation_agent_card.to_dict(), indent=2)}")
-# --- End AgentCard Definition ---
+
 
 
 if not os.getenv("GOOGLE_API_KEY"):
@@ -104,31 +96,30 @@ elif not getattr(genai, 'API_KEY', None) and os.getenv("GOOGLE_API_KEY"):
     try: genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
     except Exception as e: print(f"Error configuring GenAI in ReconciliationAgent: {e}")
 
-# Helper functions (same as before)
-def _compare_strings_fuzzy_local(s1,s2,t=0.8): ... # Ellipsis, use full code
+def _compare_strings_fuzzy_local(s1,s2,t=0.8): ... 
 def _compare_amounts_local(a1,a2,t=0.01): ...
 def _get_action_required_local(s): ...
-# --- Start Full Helper Functions ---
+
 def _compare_strings_fuzzy_local(s1: Optional[str], s2: Optional[str], threshold=0.8) -> bool:
-    if s1 is None and s2 is None: return True; # ... (rest of function from previous)
+    if s1 is None and s2 is None: return True; 
     if s1 is None or s2 is None: return False
     clean_s1 = re.sub(r'[^\w\s]', '', s1.lower().strip()); clean_s2 = re.sub(r'[^\w\s]', '', s2.lower().strip())
     if not clean_s1 and not clean_s2: return True
     if not clean_s1 or not clean_s2: return False
     return SequenceMatcher(None, clean_s1, clean_s2).ratio() >= threshold
 def _compare_amounts_local(amount1: Any, amount2: Any, tolerance=0.01) -> bool:
-    try: # ... (rest of function from previous)
+    try: 
         amt1 = float(str(amount1).replace(',','')) if amount1 is not None else 0.0
         amt2 = float(str(amount2).replace(',','')) if amount2 is not None else 0.0
         return abs(amt1 - amt2) <= tolerance
     except (ValueError, TypeError): return False
-def _get_action_required_local(status: str) -> str: # ... (rest of function from previous)
+def _get_action_required_local(status: str) -> str: 
     actions = { "APPROVED": "Proceed.", "NEEDS_REVIEW": "Manual review.", "REJECTED": "Investigate." }
     return actions.get(status, "Unknown status")
-# --- End Full Helper Functions ---
+
 
 def _perform_reconciliation_logic_tool(invoice_data_json_str: str, po_data_json_str: str) -> dict:
-    # ... (Implementation is THE SAME as your last working version for this tool)
+    
     print(f"RECON_AGENT_TOOL: _perform_reconciliation_logic_tool called.")
     try:
         invoice_data_full = json.loads(invoice_data_json_str); po_data_full = json.loads(po_data_json_str)
@@ -165,7 +156,7 @@ def _perform_reconciliation_logic_tool(invoice_data_json_str: str, po_data_json_
     except Exception as e: print(f"ERROR: {e}\n{traceback.format_exc()}"); return {"status": "error", "error_message": f"Reco logic error: {str(e)}"}
 
 reconciliation_llm_agent = LlmAgent(
-    name=reconciliation_agent_card.name, # Use name from AgentCard
+    name=reconciliation_agent_card.name, 
     model=os.getenv("ADK_MODEL", "gemini-1.5-flash-latest"),
     description=reconciliation_agent_card.description,
     instruction=(

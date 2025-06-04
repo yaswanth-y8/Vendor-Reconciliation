@@ -214,7 +214,7 @@ def process_raw_document_to_json(raw_document_file_path: str, document_type: str
             "line_items": gemini_extracted_data.get("line_items", []),
             "confidence_score": gemini_extracted_data.get("confidence_score", 0.85) 
         }
-        # Add type-specific fields if they exist in Gemini's output based on the prompt
+        
         if document_type.lower() == "invoice":
             data_payload["related_po_number"] = gemini_extracted_data.get("related_po_number")
     

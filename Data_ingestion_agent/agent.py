@@ -1,11 +1,8 @@
-# data_ingestion_agent/agent.py
 import os
 import json
 from typing import Dict, Any,List
 from google.adk.agents.llm_agent import LlmAgent
-# from google.adk import AgentCard # Hypothetical import from your ADK
-# from a2a.types import Part # Hypothetical import from your ADK
-# --- Path Setup & other imports (process_raw_document_to_json, store_invoice/po_data) ---
+
 import sys
 project_root_di = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root_di not in sys.path: sys.path.insert(0, project_root_di)
@@ -13,41 +10,35 @@ from document_parser import process_raw_document_to_json
 from database_manager import store_invoice_data, store_po_data
 import google.generativeai as genai
 
-# ---- AgentCard Definition (Hypothetical based on your snippet) ----
-# These would be dynamically determined or configured if agents run on different ports/hosts
+
 INGESTION_AGENT_HOST = os.getenv("DATA_INGESTION_AGENT_HOST", "localhost")
-INGESTION_AGENT_PORT = int(os.getenv("DATA_INGESTION_AGENT_PORT", 8001)) # Example port
+INGESTION_AGENT_PORT = int(os.getenv("DATA_INGESTION_AGENT_PORT", 8001)) 
 
-# In orchestrator_agent/agent.py
-# In data_ingestion_agent/agent.py
-# In reconciliation_processing_agent/agent.py
 
-# --- Start Hypothetical AgentCard and related types ---
-class AgentCapability: # Mock
+class AgentCapability: 
     def __init__(self, name: str, description: str, input_schema=None, output_schema=None):
         self.name = name
         self.description = description
-        # self.input_schema = input_schema # Store if needed for to_dict
-        # self.output_schema = output_schema # Store if needed for to_dict
-    def to_dict(self) -> Dict[str, Any]: # ADDED
+        
+    def to_dict(self) -> Dict[str, Any]: 
         return {"name": self.name, "description": self.description}
 
-class AgentSkill: # Mock
+class AgentSkill: 
     def __init__(self, name: str, description: str, capabilities: List[AgentCapability]):
         self.name = name
         self.description = description
         self.capabilities = capabilities
-    def to_dict(self) -> Dict[str, Any]: # ADDED
+    def to_dict(self) -> Dict[str, Any]: 
         return {
             "name": self.name, 
             "description": self.description, 
             "capabilities": [cap.to_dict() for cap in self.capabilities]
         }
 
-class AgentCard: # Mock
+class AgentCard: 
     def __init__(self, name: str, description: str, url: str, version: str, 
                  defaultInputModes: List[str], defaultOutputModes: List[str], 
-                 capabilities: List[AgentCapability], # Assuming top-level capabilities
+                 capabilities: List[AgentCapability], 
                  skills: List[AgentSkill]):
         self.name = name
         self.description = description
@@ -55,10 +46,10 @@ class AgentCard: # Mock
         self.version = version
         self.defaultInputModes = defaultInputModes
         self.defaultOutputModes = defaultOutputModes
-        self.capabilities = capabilities # List of AgentCapability objects
-        self.skills = skills # List of AgentSkill objects
+        self.capabilities = capabilities 
+        self.skills = skills 
 
-    def to_dict(self) -> Dict[str, Any]: # ADDED
+    def to_dict(self) -> Dict[str, Any]: 
         return {
             "name": self.name,
             "description": self.description,
@@ -69,12 +60,11 @@ class AgentCard: # Mock
             "capabilities": [cap.to_dict() for cap in self.capabilities],
             "skills": [skill.to_dict() for skill in self.skills]
         }
-# --- End Hypothetical AgentCard and related types ---
-# Define capabilities and skills for this agent's AgentCard
+
 ingestion_capability = AgentCapability(
     name="_ingest_and_store_document_tool",
     description="Extracts data from a document file and stores it."
-    # Add input/output schemas if your ADK supports it for tool discovery
+    
 )
 ingestion_skill = AgentSkill(
     name="Document Ingestion Skill",
@@ -83,18 +73,17 @@ ingestion_skill = AgentSkill(
 )
 
 data_ingestion_agent_card = AgentCard(
-    name="data_ingestion_specialist_agent", # Must match name used by orchestrator
+    name="data_ingestion_specialist_agent", 
     description="Specialized agent for uploading raw documents, extracting data, and storing them.",
-    url=f"http://{INGESTION_AGENT_HOST}:{INGESTION_AGENT_PORT}/invoke", # ADK endpoint
+    url=f"http://{INGESTION_AGENT_HOST}:{INGESTION_AGENT_PORT}/invoke", 
     version="1.0.0",
-    defaultInputModes=["text/plain", "application/json"], # What this agent can receive
-    defaultOutputModes=["application/json"], # What this agent produces
-    capabilities=[], # Top-level capabilities if any
+    defaultInputModes=["text/plain", "application/json"], 
+    defaultOutputModes=["application/json"], 
+    capabilities=[],
     skills=[ingestion_skill]
 )
-# In a real ADK system, this card might be registered with a central resolver.
+
 print(f"DATA_INGESTION_AGENT: Defined AgentCard: {json.dumps(data_ingestion_agent_card.to_dict(), indent=2)}")
-# --- End AgentCard Definition ---
 
 
 if not os.getenv("GOOGLE_API_KEY"):
@@ -105,7 +94,7 @@ elif not getattr(genai, 'API_KEY', None) and os.getenv("GOOGLE_API_KEY"):
 
 
 def _ingest_and_store_document_tool(raw_document_file_path: str, document_type: str) -> dict:
-    # ... (Implementation is THE SAME as your last working version)
+    
     print(f"DATA_INGESTION_TOOL: Processing file='{raw_document_file_path}', type='{document_type}'")
     if document_type.lower() not in ["invoice", "purchase_order"]: return {"status": "error", "error_message": "Invalid document_type."}
     extraction_result = process_raw_document_to_json(raw_document_file_path, document_type)
@@ -121,9 +110,9 @@ def _ingest_and_store_document_tool(raw_document_file_path: str, document_type: 
     else: return {"status": "error", "error_message": f"Failed to store {document_type} '{doc_number}'.", "full_extraction_result": extraction_result}
 
 
-# This is the agent instance for this module
+
 data_ingestion_llm_agent = LlmAgent(
-    name=data_ingestion_agent_card.name, # Use name from AgentCard
+    name=data_ingestion_agent_card.name, 
     model=os.getenv("ADK_MODEL", "gemini-1.5-flash-latest"),
     description=data_ingestion_agent_card.description,
     instruction=(
@@ -139,5 +128,5 @@ data_ingestion_llm_agent = LlmAgent(
     tools=[_ingest_and_store_document_tool]
 )
 
-# If running this agent directly with `adk run data_ingestion_agent/agent.py`
+
 root_agent = data_ingestion_llm_agent
